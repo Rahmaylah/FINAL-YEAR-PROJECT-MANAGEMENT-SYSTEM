@@ -1,0 +1,34 @@
+{
+	"folders": [
+		{
+			"path": "../accounts"
+		},
+		{
+			"path": "../api"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../docs"
+		},
+		{
+			"path": "../frontend"
+		},
+		{
+			"path": "../fypms"
+		},
+		{
+			"path": "../node_modules"
+		},
+		{
+			"path": "../projects"
+		},
+		{
+			"path": "../testingscripts"
+		},
+		{
+			"path": "../venv"
+		}
+	]
+}

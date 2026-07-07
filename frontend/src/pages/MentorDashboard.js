@@ -1,0 +1,1362 @@
+import React, { useContext, useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import axios from '../services/axiosConfig';
+import { AuthContext } from '../context/AuthContext';
+import '../styles/Dashboard.css';
+import nitLogo from '../assets/nit.png';
+
+const STATUS_OPTIONS = [
+  { value: 'proposed', label: 'Proposed' },
+  { value: 'approved', label: 'Approved' },
+  { value: 'rejected', label: 'Rejected' },
+  { value: 'completed', label: 'Completed' },
+];
+
+function MentorDashboard() {
+  const { user, logout } = useContext(AuthContext);
+  const navigate = useNavigate();
+  const [profile, setProfile] = useState({
+    first_name: '',
+    middle_name: '',
+    last_name: '',
+    email: '',
+    username: '',
+    role: ''
+  });
+  const [profileDraft, setProfileDraft] = useState({ middle_name: '', email: '' });
+  const [profileExpanded, setProfileExpanded] = useState(false);
+  const [editingProfile, setEditingProfile] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileMessage, setProfileMessage] = useState('');
+  const [showUserMenu, setShowUserMenu] = useState(false);
+  const [showChangePassword, setShowChangePassword] = useState(false);
+  const [passwordData, setPasswordData] = useState({
+    current_password: '',
+    new_password: '',
+    confirm_password: ''
+  });
+  const [passwordSaving, setPasswordSaving] = useState(false);
+  const [passwordMessage, setPasswordMessage] = useState('');
+
+  const [mentees, setMentees] = useState([]);
+  const [projects, setProjects] = useState([]);
+  const [projectUsers, setProjectUsers] = useState([]);
+  const [duplicates, setDuplicates] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [expandedStudents, setExpandedStudents] = useState(false);
+  const [expandedProjects, setExpandedProjects] = useState(false);
+  const [expandedPresentations, setExpandedPresentations] = useState(false);
+  const [presentations, setPresentations] = useState([]);
+  
+  // ==================== PRESENTATION CRITERIA STATES ====================
+  const [selectedPresentation, setSelectedPresentation] = useState('');
+  const [selectedStudent, setSelectedStudent] = useState('');
+  const [criteriaList, setCriteriaList] = useState([]);
+  const [gradingScores, setGradingScores] = useState({});
+  const [gradingResult, setGradingResult] = useState(null);
+  const [gradingMessage, setGradingMessage] = useState('');
+  const [gradingSaving, setGradingSaving] = useState(false);
+  const [loadingCriteria, setLoadingCriteria] = useState(false);
+  // ==================== END PRESENTATION CRITERIA STATES ====================
+
+  const [selectedProject, setSelectedProject] = useState(null);
+  const [showProjectDetailsModal, setShowProjectDetailsModal] = useState(false);
+  const [similarProjects, setSimilarProjects] = useState([]);
+  const [loadingSimilar, setLoadingSimilar] = useState(false);
+  const [projectSaving, setProjectSaving] = useState(false);
+  const [projectMessage, setProjectMessage] = useState('');
+  
+  // ==================== MENTOR COMMENT STATE ====================
+  const [mentorComment, setMentorComment] = useState('');
+  const [commentSaving, setCommentSaving] = useState(false);
+  const [commentMessage, setCommentMessage] = useState('');
+
+  // Image error fallback
+  const [imageError, setImageError] = useState(false);
+
+  useEffect(() => {
+    if (!user) return;
+
+    setProfile({
+      first_name: user.first_name || '',
+      middle_name: user.middle_name || '',
+      last_name: user.last_name || '',
+      email: user.email || '',
+      username: user.username || '',
+      role: user.role || ''
+    });
+    setProfileDraft({
+      middle_name: user.middle_name || '',
+      email: user.email || ''
+    });
+  }, [user]);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      if (!user || !user.id) return;
+
+      setLoading(true);
+      try {
+        const menteesResponse = await axios.get('/api/users/', {
+          params: {
+            mentor: user.id,
+            role: 'student'
+          }
+        });
+        const menteesData = menteesResponse.data.results || [];
+        setMentees(menteesData);
+
+        const projectsResponse = await axios.get('/api/projects/');
+        const projectsData = projectsResponse.data.results || [];
+
+        const projectUsersResponse = await axios.get('/api/project-users/');
+        const projectUsersData = projectUsersResponse.data.results || [];
+        setProjectUsers(projectUsersData);
+
+        const duplicatesResponse = await axios.get('/api/duplicate-flags/');
+        const duplicatesData = duplicatesResponse.data.results || [];
+        setDuplicates(duplicatesData);
+
+        const presentationsResponse = await axios.get('/api/presentations/');
+        const presentationsData = presentationsResponse.data.results || [];
+        setPresentations(presentationsData);
+
+        const menteeIds = menteesData.map((student) => student.id);
+        const relatedProjectIds = projectUsersData
+          .filter((relation) => menteeIds.includes(relation.user))
+          .map((relation) => relation.project);
+
+        const filteredProjectIds = [...new Set(relatedProjectIds)];
+        const filteredProjects = projectsData.filter((project) => filteredProjectIds.includes(project.id));
+
+        setProjects(filteredProjects);
+      } catch (error) {
+        console.error('Error fetching mentor dashboard data:', error);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchData();
+  }, [user]);
+
+  // ==================== PRESENTATION CRITERIA FUNCTIONS ====================
+
+  // Fetch criteria from database for selected presentation
+  const fetchCriteria = async (presentationId) => {
+    if (!presentationId) {
+      setCriteriaList([]);
+      return [];
+    }
+
+    setLoadingCriteria(true);
+    try {
+      const response = await axios.get('/api/presentation-criteria/?presentation=' + presentationId);
+      const criteria = response.data.results || response.data || [];
+      setCriteriaList(criteria);
+      setLoadingCriteria(false);
+      return criteria;
+    } catch (error) {
+      console.error('Error fetching criteria:', error);
+      setCriteriaList([]);
+      setLoadingCriteria(false);
+      return [];
+    }
+  };
+
+  // Handle presentation selection
+  const handlePresentationSelect = async (presentationId) => {
+    setSelectedPresentation(presentationId);
+    setSelectedStudent('');
+    setGradingScores({});
+    setGradingResult(null);
+    setGradingMessage('');
+    setCriteriaList([]);
+
+    if (presentationId) {
+      await fetchCriteria(presentationId);
+    }
+  };
+
+  // Handle student selection
+  const handleStudentSelect = async (studentId) => {
+    setSelectedStudent(studentId);
+    setGradingScores({});
+    setGradingResult(null);
+    setGradingMessage('');
+
+    if (!studentId || !selectedPresentation) return;
+
+    try {
+      // Check if student already has a result for this presentation
+      const response = await axios.get('/api/presentation-results/?presentation=' + selectedPresentation + '&student=' + studentId);
+      const results = response.data.results || response.data || [];
+      
+      if (results.length > 0) {
+        const result = results[0];
+        setGradingResult(result);
+        
+        // Fetch existing scores
+        const scoresResponse = await axios.get('/api/presentation-result-criteria/?result=' + result.id);
+        const existingScores = scoresResponse.data.results || scoresResponse.data || [];
+        
+        const scoresMap = {};
+        existingScores.forEach(score => {
+          scoresMap[score.criteria] = {
+            score: score.score,
+            selected_option: score.selected_option,
+            comment: score.comment || ''
+          };
+        });
+        setGradingScores(scoresMap);
+      } else {
+        setGradingResult(null);
+      }
+    } catch (error) {
+      console.error('Error fetching student result:', error);
+    }
+  };
+
+  // Handle score change for a criteria
+  const handleScoreChange = (criteriaId, field, value) => {
+    setGradingScores(prev => ({
+      ...prev,
+      [criteriaId]: {
+        ...prev[criteriaId],
+        [field]: value
+      }
+    }));
+  };
+
+  // Save grades
+  const handleSaveGrades = async () => {
+    if (!selectedPresentation || !selectedStudent) {
+      setGradingMessage('❌ Please select both presentation and student.');
+      return;
+    }
+
+    if (criteriaList.length === 0) {
+      setGradingMessage('❌ No criteria available for this presentation.');
+      return;
+    }
+
+    setGradingSaving(true);
+    setGradingMessage('');
+
+    try {
+      let resultId = gradingResult?.id;
+      
+      // If no result exists, create one
+      if (!resultId) {
+        const studentProject = projects.find(p => 
+          p.project_users?.some(pu => pu.user === parseInt(selectedStudent))
+        );
+        
+        const resultResponse = await axios.post('/api/presentation-results/', {
+          presentation: parseInt(selectedPresentation),
+          student: parseInt(selectedStudent),
+          project: studentProject?.id || null,
+          comment: '',
+          marks: null
+        });
+        resultId = resultResponse.data.id;
+        setGradingResult(resultResponse.data);
+      }
+
+      // Save each criteria score
+      const scores = Object.entries(gradingScores).map(([criteriaId, data]) => ({
+        criteria_id: parseInt(criteriaId),
+        score: data.score !== undefined && data.score !== '' ? parseFloat(data.score) : null,
+        selected_option: data.selected_option || '',
+        comment: data.comment || ''
+      }));
+
+      for (const scoreData of scores) {
+        // Check if score already exists
+        const existingResponse = await axios.get('/api/presentation-result-criteria/?result=' + resultId + '&criteria=' + scoreData.criteria_id);
+        const existing = existingResponse.data.results || existingResponse.data || [];
+        
+        if (existing.length > 0) {
+          await axios.put('/api/presentation-result-criteria/' + existing[0].id + '/', {
+            result: resultId,
+            criteria: scoreData.criteria_id,
+            score: scoreData.score,
+            selected_option: scoreData.selected_option,
+            comment: scoreData.comment
+          });
+        } else {
+          await axios.post('/api/presentation-result-criteria/', {
+            result: resultId,
+            criteria: scoreData.criteria_id,
+            score: scoreData.score,
+            selected_option: scoreData.selected_option,
+            comment: scoreData.comment
+          });
+        }
+      }
+
+      // Calculate total
+      await axios.post('/api/presentation-results/' + resultId + '/calculate_total/');
+      
+      setGradingMessage('✅ Grades saved successfully!');
+      setTimeout(() => {
+        setGradingMessage('');
+      }, 3000);
+    } catch (error) {
+      console.error('Error saving grades:', error);
+      
+      let errorMsg = '❌ Unable to save grades. Please try again.';
+      if (error.response) {
+        console.error('Response data:', error.response.data);
+        if (error.response.data?.error) {
+          errorMsg = '❌ ' + error.response.data.error;
+        } else if (error.response.data?.detail) {
+          errorMsg = '❌ ' + error.response.data.detail;
+        }
+      }
+      setGradingMessage(errorMsg);
+    } finally {
+      setGradingSaving(false);
+    }
+  };
+
+  // ==================== END PRESENTATION CRITERIA FUNCTIONS ====================
+
+  const handleLogout = () => {
+    logout();
+    navigate('/login');
+  };
+
+  const handleProfileDraftChange = (event) => {
+    const { name, value } = event.target;
+    setProfileDraft((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleSaveProfile = async () => {
+    if (!user || !user.id) return;
+    setProfileSaving(true);
+    setProfileMessage('');
+
+    try {
+      const response = await axios.patch('/api/users/' + user.id + '/', profileDraft);
+      setProfile((prev) => ({ ...prev, ...response.data }));
+      setProfileDraft({
+        middle_name: response.data.middle_name || '',
+        email: response.data.email || ''
+      });
+      setEditingProfile(false);
+      setProfileMessage('✅ Profile updated successfully.');
+      localStorage.setItem('user', JSON.stringify({ ...user, ...response.data }));
+    } catch (error) {
+      console.error('Error saving profile:', error);
+      setProfileMessage('❌ Unable to update profile. Please try again.');
+    } finally {
+      setProfileSaving(false);
+    }
+  };
+
+  const handlePasswordChange = (event) => {
+    const { name, value } = event.target;
+    setPasswordData((prev) => ({ ...prev, [name]: value }));
+  };
+
+  const handleSavePassword = async () => {
+    if (!user || !user.id) return;
+    setPasswordSaving(true);
+    setPasswordMessage('');
+
+    if (passwordData.new_password !== passwordData.confirm_password) {
+      setPasswordMessage('❌ New passwords do not match.');
+      setPasswordSaving(false);
+      return;
+    }
+
+    if (passwordData.new_password.length < 8) {
+      setPasswordMessage('❌ New password must be at least 8 characters long.');
+      setPasswordSaving(false);
+      return;
+    }
+
+    try {
+      await axios.post('/api/users/set_password/', {
+        current_password: passwordData.current_password,
+        new_password: passwordData.new_password
+      });
+      setPasswordMessage('✅ Password changed successfully.');
+      setPasswordData({
+        current_password: '',
+        new_password: '',
+        confirm_password: ''
+      });
+      setShowChangePassword(false);
+    } catch (error) {
+      console.error('Error changing password:', error);
+      if (error.response && error.response.data) {
+        if (error.response.data.error) {
+          setPasswordMessage('❌ ' + error.response.data.error);
+        } else if (error.response.data.detail) {
+          setPasswordMessage('❌ ' + error.response.data.detail);
+        } else {
+          setPasswordMessage('❌ Unable to change password. Please try again.');
+        }
+      } else if (error.message) {
+        setPasswordMessage('❌ Network error: ' + error.message);
+      } else {
+        setPasswordMessage('❌ Unable to change password. Please try again.');
+      }
+    } finally {
+      setPasswordSaving(false);
+    }
+  };
+
+  const toggleStudents = () => setExpandedStudents((prev) => !prev);
+  const toggleProjects = () => setExpandedProjects((prev) => !prev);
+  const togglePresentations = () => setExpandedPresentations((prev) => !prev);
+
+  const getProjectStudents = (projectId) => {
+    return projectUsers
+      .filter((relation) => relation.project === projectId)
+      .map((relation) => relation.user_name);
+  };
+
+  const getProjectDuplicateFlags = (projectId) => (
+    duplicates.filter((flag) => flag.project === projectId)
+  );
+
+  const formatRegistrationNumbers = (registrationNumbers) => {
+    if (!Array.isArray(registrationNumbers) || registrationNumbers.length === 0) {
+      return 'Reg: N/A';
+    }
+    return 'Reg: ' + registrationNumbers.join(', ');
+  };
+
+  const openProjectDetails = (project) => {
+    const loadProjectDetails = async () => {
+      try {
+        const response = await axios.get('/api/projects/' + project.id + '/');
+        setSelectedProject(response.data);
+        // Reset comment fields
+        setMentorComment('');
+        setCommentMessage('');
+      } catch (error) {
+        console.error('Error loading project details:', error);
+        setSelectedProject(project);
+      }
+    };
+    loadProjectDetails();
+    setShowProjectDetailsModal(true);
+    // Fetch similar projects if flagged, but comment is ALWAYS on the project itself
+    if (project.is_flagged_duplicate) {
+      fetchSimilarProjects(project.id);
+    } else {
+      setSimilarProjects([]);
+    }
+  };
+
+  const fetchSimilarProjects = async (projectId) => {
+    setLoadingSimilar(true);
+    try {
+      const response = await axios.get('/api/duplicate-flags/?project=' + projectId);
+      
+      let flags = [];
+      if (Array.isArray(response.data)) {
+        flags = response.data;
+      } else if (response.data.results) {
+        flags = response.data.results;
+      }
+      
+      const similarProjectsWithFlags = [];
+      for (const flag of flags) {
+        try {
+          const projectResponse = await axios.get('/api/projects/' + flag.similar_project + '/');
+          similarProjectsWithFlags.push({
+            ...projectResponse.data,
+            similarity_score: flag.similarity_score,
+            flag_id: flag.id,
+            reviewed: flag.reviewed,
+            reviewed_by: flag.reviewed_by,
+            reviewed_at: flag.reviewed_at
+          });
+        } catch (error) {
+          console.error('Error fetching project ' + flag.similar_project + ':', error);
+        }
+      }
+      setSimilarProjects(similarProjectsWithFlags);
+    } catch (error) {
+      console.error('Error fetching similar projects:', error);
+      setSimilarProjects([]);
+    } finally {
+      setLoadingSimilar(false);
+    }
+  };
+
+  const markFlagReviewed = async (flagId) => {
+    try {
+      await axios.post('/api/duplicate-flags/' + flagId + '/mark_reviewed/');
+      setSimilarProjects(prev => prev.map(project =>
+        project.flag_id === flagId ? { ...project, reviewed: true } : project
+      ));
+    } catch (error) {
+      console.error('Error marking flag as reviewed:', error);
+    }
+  };
+
+  // ==================== UPDATED: Handle Project Status Change with Comment ====================
+  const handleProjectStatusChange = async (projectId, newStatus) => {
+    setProjectSaving(true);
+    setProjectMessage('');
+    setCommentSaving(true);
+    
+    try {
+      // Update project status
+      const statusResponse = await axios.patch('/api/projects/' + projectId + '/', { 
+        status: newStatus 
+      });
+      
+      // If there's a mentor comment, save it to the project (NOT to flagged)
+      if (mentorComment.trim()) {
+        await axios.patch('/api/projects/' + projectId + '/', {
+          mentor_comment: mentorComment.trim()
+        });
+      }
+      
+      // Update local projects state
+      setProjects((prevProjects) =>
+        prevProjects.map((project) =>
+          project.id === projectId ? { 
+            ...project, 
+            ...statusResponse.data, 
+            mentor_comment: mentorComment.trim() || project.mentor_comment 
+          } : project
+        )
+      );
+      
+      // Update selected project
+      setSelectedProject((prev) => prev ? { 
+        ...prev, 
+        ...statusResponse.data,
+        mentor_comment: mentorComment.trim() || prev.mentor_comment 
+      } : prev);
+      
+      setProjectMessage('✅ Project status updated successfully!');
+      if (mentorComment.trim()) {
+        setCommentMessage('✅ Comment saved successfully!');
+      }
+      
+      // Clear comment after successful save
+      setTimeout(() => {
+        setMentorComment('');
+        setCommentMessage('');
+        setProjectMessage('');
+      }, 3000);
+      
+    } catch (error) {
+      console.error('Error updating project:', error);
+      setProjectMessage('❌ Unable to update project status. Please try again.');
+    } finally {
+      setProjectSaving(false);
+      setCommentSaving(false);
+    }
+  };
+
+  const flaggedProjects = projects.filter((project) => project.is_flagged_duplicate);
+  const normalProjects = projects.filter((project) => !project.is_flagged_duplicate);
+  const selectedPresentationDetails = presentations.find(
+    (presentation) => String(presentation.id) === String(selectedPresentation)
+  );
+
+  return (
+    <div className="dashboard-container mentor-dashboard">
+      <nav className="navbar navbar-expand-lg navbar-light bg-white fixed-top">
+        <div className="container-fluid">
+          <span className="navbar-brand d-flex align-items-center">
+            {!imageError ? (
+              <img 
+                src={nitLogo} 
+                alt="NIT Logo" 
+                style={{ width: 40, height: 40, marginRight: 8 }}
+                onError={() => setImageError(true)}
+              />
+            ) : (
+              <span style={{ 
+                width: 40, height: 40, marginRight: 8, 
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                background: '#0d6efd', color: 'white', borderRadius: '4px',
+                fontWeight: 'bold', fontSize: '14px'
+              }}>NIT</span>
+            )}
+            <span>FYPMS - Mentor Dashboard</span>
+          </span>
+          <div className="dropdown ms-auto" style={{ cursor: 'pointer' }}>
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: '8px' }}
+              onClick={() => setShowUserMenu((prev) => !prev)}
+              id="userMenuButton"
+              aria-expanded={showUserMenu}
+            >
+              <span style={{ fontSize: '1rem', color: '#333' }}>
+                {profile?.username || profile?.last_name || 'Mentor'}
+              </span>
+              <span style={{ fontSize: '0.8rem', color: '#666', transform: showUserMenu ? 'rotate(180deg)' : 'rotate(90deg)', transition: 'transform 0.3s ease', display: 'inline-block' }}>Λ</span>
+            </div>
+            <ul className={"dropdown-menu " + (showUserMenu ? 'show' : '')} style={{ width: '140px', position: 'fixed', right: '0px', top: '70px', marginRight: '10px', padding: '5px 0px' }} aria-labelledby="userMenuButton">
+              <li>
+                <button className="dropdown-item" style={{ fontSize: '0.9rem', padding: '5px 10px' }} onClick={() => { setProfileExpanded(true); setShowUserMenu(false); }}>
+                  Profile
+                </button>
+              </li>
+              <li>
+                <button className="dropdown-item" style={{ fontSize: '0.9rem', padding: '5px 10px' }} onClick={() => { setShowChangePassword(true); setShowUserMenu(false); }}>
+                  Change Password
+                </button>
+              </li>
+              <li><hr className="dropdown-divider" style={{ margin: '4px 0' }} /></li>
+              <li>
+                <button className="dropdown-item" style={{ fontSize: '0.9rem', padding: '5px 10px' }} onClick={handleLogout}>
+                  Logout
+                </button>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </nav>
+
+      {/* Profile Modal */}
+      {profileExpanded && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 1000
+        }} onClick={() => setProfileExpanded(false)}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '8px',
+            padding: '30px',
+            width: '90%',
+            maxWidth: '500px',
+            boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+          }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h5 style={{ margin: 0 }}>👤 Personal Profile</h5>
+              <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setProfileExpanded(false)}>
+                ✕
+              </button>
+            </div>
+            <hr />
+            <div>
+              <p><strong>Username:</strong> {profile.username || 'N/A'}</p>
+              <p><strong>Role:</strong> {profile.role || 'N/A'}</p>
+              <p><strong>First Name:</strong> {profile.first_name || 'N/A'}</p>
+              <p><strong>Last Name:</strong> {profile.last_name || 'N/A'}</p>
+              <div className="mb-3">
+                <label className="form-label">Middle Name</label>
+                <input
+                  type="text"
+                  name="middle_name"
+                  className="form-control"
+                  value={profileDraft.middle_name}
+                  onChange={handleProfileDraftChange}
+                  disabled={!editingProfile}
+                />
+              </div>
+              <div className="mb-3">
+                <label className="form-label">Email Address</label>
+                <input
+                  type="email"
+                  name="email"
+                  className="form-control"
+                  value={profileDraft.email}
+                  onChange={handleProfileDraftChange}
+                  disabled={!editingProfile}
+                />
+              </div>
+              {editingProfile ? (
+                <div className="d-flex gap-2">
+                  <button className="btn btn-primary" onClick={handleSaveProfile} disabled={profileSaving}>
+                    {profileSaving ? 'Saving...' : 'Save Changes'}
+                  </button>
+                  <button
+                    className="btn btn-outline-secondary"
+                    onClick={() => {
+                      setEditingProfile(false);
+                      setProfileDraft({
+                        middle_name: profile.middle_name || '',
+                        email: profile.email || ''
+                      });
+                    }}
+                    disabled={profileSaving}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : (
+                <button className="btn btn-secondary" onClick={() => setEditingProfile(true)}>
+                  Edit Details
+                </button>
+              )}
+              {profileMessage && <p className={'mt-3 ' + (profileMessage.includes('✅') ? 'text-success' : 'text-danger')}>{profileMessage}</p>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Change Password Modal */}
+      {showChangePassword && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 1000
+        }} onClick={() => setShowChangePassword(false)}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '8px',
+            padding: '30px',
+            width: '90%',
+            maxWidth: '500px',
+            boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+          }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h5 style={{ margin: 0 }}>🔑 Change Password</h5>
+              <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowChangePassword(false)}>
+                ✕
+              </button>
+            </div>
+            <hr />
+            <div>
+              <div className="mb-3">
+                <label className="form-label">Current Password</label>
+                <input
+                  type="password"
+                  name="current_password"
+                  className="form-control"
+                  value={passwordData.current_password}
+                  onChange={handlePasswordChange}
+                  placeholder="Enter current password"
+                />
+              </div>
+              <div className="mb-3">
+                <label className="form-label">New Password</label>
+                <input
+                  type="password"
+                  name="new_password"
+                  className="form-control"
+                  value={passwordData.new_password}
+                  onChange={handlePasswordChange}
+                  placeholder="Enter new password"
+                />
+              </div>
+              <div className="mb-3">
+                <label className="form-label">Confirm New Password</label>
+                <input
+                  type="password"
+                  name="confirm_password"
+                  className="form-control"
+                  value={passwordData.confirm_password}
+                  onChange={handlePasswordChange}
+                  placeholder="Confirm new password"
+                />
+              </div>
+              <div className="d-flex gap-2">
+                <button className="btn btn-primary" onClick={handleSavePassword} disabled={passwordSaving}>
+                  {passwordSaving ? 'Changing...' : 'Change Password'}
+                </button>
+                <button
+                  className="btn btn-outline-secondary"
+                  onClick={() => {
+                    setShowChangePassword(false);
+                    setPasswordData({
+                      current_password: '',
+                      new_password: '',
+                      confirm_password: ''
+                    });
+                    setPasswordMessage('');
+                  }}
+                  disabled={passwordSaving}
+                >
+                  Cancel
+                </button>
+              </div>
+              {passwordMessage && (
+                <p className={'mt-3 ' + (passwordMessage.includes('✅') ? 'text-success' : 'text-danger')}>
+                  {passwordMessage}
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="container mt-5">
+        <div className="welcome-section">
+          <h1>
+            Welcome back, <span className="role-name">{profile.first_name || profile.username || 'Mentor'}</span>.
+          </h1>
+          <div className="lead">
+            <div className="d-flex flex-column flex-lg-row align-items-start align-items-lg-center gap-2 gap-lg-4">
+              <div className="d-flex align-items-center gap-3">
+                <span>Mentees: <strong>{mentees.length}</strong></span>
+                <span>Projects: <strong>{projects.length}</strong></span>
+              </div>
+              <span>Flagged duplicates: <strong>{flaggedProjects.length}</strong></span>
+            </div>
+          </div>
+        </div>
+
+        <div className="row mt-2">
+          <div className="col-md-12">
+            <div className="card dashboard-card">
+              <div className="card-body">
+                <div
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                  onClick={toggleStudents}
+                >
+                  <div>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>👨‍🎓 Mentees</h5>
+                    <p className="card-text">View and manage your assigned students</p>
+                  </div>
+                  <span
+                    style={{
+                      fontSize: '1.5em',
+                      color: '#2a2d30',
+                      transform: expandedStudents ? 'rotate(360deg)' : 'rotate(-90deg)',
+                      transition: 'transform 0.05s ease'
+                    }}
+                  >
+                    ▼
+                  </span>
+                </div>
+
+                {expandedStudents && (
+                  <>
+                    <hr />
+                    {loading ? (
+                      <p>Loading students...</p>
+                    ) : mentees.length > 0 ? (
+                      <ul style={{ marginBottom: 0 }}>
+                        {mentees.map((student) => (
+                          <li key={student.id} className="mb-3">
+                            <strong>{student.first_name} {student.middle_name} {student.last_name} - ({student.registration_number})</strong>
+                            <br />
+                            <small style={{ color: '#666' }}>{student.email}</small>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p>No students assigned yet.</p>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="row mt-2">
+          <div className="col-md-12">
+            <div className="card dashboard-card">
+              <div className="card-body">
+                <div
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                  onClick={toggleProjects}
+                >
+                  <div>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>📁 Projects</h5>
+                    <p className="card-text">Review flagged and normal projects from your students</p>
+                  </div>
+                  <span
+                    style={{
+                      fontSize: '1.5em',
+                      color: '#2a2d30',
+                      transform: expandedProjects ? 'rotate(360deg)' : 'rotate(-90deg)',
+                      transition: 'transform 0.05s ease'
+                    }}
+                  >
+                    ▼
+                  </span>
+                </div>
+
+                {expandedProjects && (
+                  <>
+                    <hr />
+                    {loading ? (
+                      <p>Loading projects...</p>
+                    ) : projects.length > 0 ? (
+                      <>
+                        {flaggedProjects.length > 0 ? (
+                          <div className="mb-4">
+                            <h6>⚠️ Flagged Projects</h6>
+                            <div className="list-group">
+                              {flaggedProjects.map((project) => (
+                                <div
+                                  key={project.id}
+                                  className="list-group-item"
+                                  style={{ cursor: 'pointer' }}
+                                  onClick={() => openProjectDetails(project)}
+                                >
+                                  <div className="d-flex justify-content-between align-items-center">
+                                    <div>
+                                      <h6>{project.title}</h6>
+                                      <p className="mb-1">
+                                        <strong>Status:</strong> {project.status} | <strong>Students:</strong>{' '}
+                                        {getProjectStudents(project.id).join(', ') || 'No students assigned'}
+                                      </p>
+                                      {getProjectDuplicateFlags(project.id).length > 0 && (
+                                        <p className="mb-1 text-muted">
+                                          <strong>Similar to:</strong>{' '}
+                                          {getProjectDuplicateFlags(project.id)
+                                            .map((flag) => flag.similar_project_title + ' (' + (flag.similarity_score * 100).toFixed(1) + '%) - ' + formatRegistrationNumbers(flag.similar_project_registration_numbers))
+                                            .join(', ')}
+                                        </p>
+                                      )}
+                                      <small className="text-muted">
+                                        Type: {project.project_type_name || 'N/A'} | Year: {project.year}
+                                      </small>
+                                    </div>
+                                    <i className="bi bi-eye" style={{ fontSize: '1.4em', color: '#007bff' }}></i>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="mb-4">
+                            <h6>⚠️ Flagged Projects</h6>
+                            <p className="text-muted">No flagged projects yet.</p>
+                          </div>
+                        )}
+
+                        <div>
+                          <h6>📋 Unflagged Projects</h6>
+                          {normalProjects.length > 0 ? (
+                            <div className="list-group">
+                              {normalProjects.map((project) => (
+                                <div
+                                  key={project.id}
+                                  className="list-group-item"
+                                  style={{ cursor: 'pointer' }}
+                                  onClick={() => openProjectDetails(project)}
+                                >
+                                  <div className="d-flex justify-content-between align-items-center">
+                                    <div>
+                                      <h6>{project.title}</h6>
+                                      <p className="mb-1">
+                                        <strong>Status:</strong> {project.status} | <strong>Students:</strong>{' '}
+                                        {getProjectStudents(project.id).join(', ') || 'No students assigned'}
+                                      </p>
+                                      <small className="text-muted">
+                                        Type: {project.project_type_name || 'N/A'} | Year: {project.year}
+                                      </small>
+                                    </div>
+                                    <i className="bi bi-eye" style={{ fontSize: '1.4em', color: '#007bff' }}></i>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p>No non-flagged projects found.</p>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <p>No projects found for your students.</p>
+                    )}
+                    {projectMessage && <p className={'mt-3 ' + (projectMessage.includes('✅') ? 'text-success' : 'text-danger')}>{projectMessage}</p>}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* ==================== PRESENTATIONS SECTION WITH CRITERIA ==================== */}
+        <div className="row mt-2">
+          <div className="col-md-12">
+            <div className="card dashboard-card">
+              <div className="card-body">
+                <div
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', cursor: 'pointer' }}
+                  onClick={togglePresentations}
+                >
+                  <div>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>📅 Presentations & Grading</h5>
+                    <p className="card-text">Record marks and comments for student presentations</p>
+                  </div>
+                  <span
+                    style={{
+                      fontSize: '1.5em',
+                      color: '#2a2d30',
+                      transform: expandedPresentations ? 'rotate(360deg)' : 'rotate(-90deg)',
+                      transition: 'transform 0.05s ease'
+                    }}
+                  >
+                    ▼
+                  </span>
+                </div>
+
+                {expandedPresentations && (
+                  <>
+                    <hr />
+                    {presentations.length > 0 ? (
+                      <div>
+                        {/* Select Presentation */}
+                        <div className="mb-3">
+                          <label className="form-label"><strong>Select Presentation</strong></label>
+                          <select
+                            className="form-select"
+                            value={selectedPresentation}
+                            onChange={(e) => handlePresentationSelect(e.target.value)}
+                          >
+                            <option value="">-- Select a presentation --</option>
+                            {presentations.map((presentation) => (
+                              <option key={presentation.id} value={presentation.id}>
+                                {presentation.name || 'Presentation ' + presentation.id} - {presentation.presentation_date || 'TBD'}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        {/* Presentation Info */}
+                        {selectedPresentationDetails && (
+                          <div className="mb-3">
+                            <div className="alert alert-info">
+                              <strong>Maximum Marks:</strong> {selectedPresentationDetails.total_marks ?? 'N/A'} | 
+                              <strong> Pass Marks:</strong> {selectedPresentationDetails.pass_marks ?? 'N/A'}
+                              {criteriaList.length > 0 && (
+                                <span className="ms-2 badge bg-primary">{criteriaList.length} criteria</span>
+                              )}
+                              {loadingCriteria && (
+                                <span className="ms-2 badge bg-warning">Loading criteria...</span>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Select Student */}
+                        <div className="mb-3">
+                          <label className="form-label"><strong>Select Student</strong></label>
+                          <select
+                            className="form-select"
+                            value={selectedStudent}
+                            onChange={(e) => handleStudentSelect(e.target.value)}
+                          >
+                            <option value="">-- Select a student --</option>
+                            {mentees.map((student) => (
+                              <option key={student.id} value={student.id}>
+                                {student.first_name} {student.middle_name} {student.last_name}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+
+                        {/* ====== CRITERIA GRADING ====== */}
+                        {selectedStudent && selectedPresentation && (
+                          <>
+                            <hr />
+                            <h6 className="mb-3">📋 Grading Criteria for {mentees.find(s => s.id === parseInt(selectedStudent))?.first_name || 'Student'}</h6>
+
+                            {loadingCriteria ? (
+                              <div className="text-center py-4">
+                                <div className="spinner-border text-primary" role="status">
+                                  <span className="visually-hidden">Loading criteria...</span>
+                                </div>
+                                <p className="mt-2 text-muted">Loading criteria...</p>
+                              </div>
+                            ) : criteriaList.length > 0 ? (
+                              criteriaList
+                                .sort((a, b) => a.order - b.order)
+                                .map((criteria) => {
+                                  const scoreData = gradingScores[criteria.id] || {};
+                                  return (
+                                    <div key={criteria.id} className="card mb-3">
+                                      <div className="card-body">
+                                        <div className="d-flex justify-content-between align-items-start flex-wrap">
+                                          <div>
+                                            <h6 className="mb-1">{criteria.name}</h6>
+                                            <small className="text-muted d-block">{criteria.description}</small>
+                                            <small className="text-muted">Max: {criteria.max_score} pts</small>
+                                            {criteria.options && criteria.options.length > 0 && (
+                                              <div className="mt-1 small text-muted">
+                                                Options: {criteria.options.map((o, i) => (
+                                                  <span key={i} className="badge bg-light text-dark ms-1">
+                                                    {o.label} ({o.value} pts)
+                                                  </span>
+                                                ))}
+                                              </div>
+                                            )}
+                                          </div>
+                                          <div style={{ minWidth: '150px' }}>
+                                            {criteria.options && criteria.options.length > 0 ? (
+                                              <select
+                                                className="form-select form-select-sm"
+                                                value={scoreData.selected_option || ''}
+                                                onChange={(e) => {
+                                                  const selected = criteria.options.find(o => o.label === e.target.value);
+                                                  handleScoreChange(criteria.id, 'selected_option', e.target.value);
+                                                  handleScoreChange(criteria.id, 'score', selected ? selected.value : null);
+                                                }}
+                                              >
+                                                <option value="">Select...</option>
+                                                {criteria.options.map((opt, idx) => (
+                                                  <option key={idx} value={opt.label}>
+                                                    {opt.label} ({opt.value} pts)
+                                                  </option>
+                                                ))}
+                                              </select>
+                                            ) : (
+                                              <input
+                                                type="number"
+                                                step="0.5"
+                                                className="form-control form-control-sm"
+                                                placeholder="Enter marks"
+                                                value={scoreData.score || ''}
+                                                onChange={(e) => {
+                                                  const val = e.target.value ? parseFloat(e.target.value) : '';
+                                                  handleScoreChange(criteria.id, 'score', val);
+                                                }}
+                                              />
+                                            )}
+                                          </div>
+                                        </div>
+                                        <div className="mt-2">
+                                          <input
+                                            type="text"
+                                            className="form-control form-control-sm"
+                                            placeholder="Comment (optional)"
+                                            value={scoreData.comment || ''}
+                                            onChange={(e) => handleScoreChange(criteria.id, 'comment', e.target.value)}
+                                          />
+                                        </div>
+                                      </div>
+                                    </div>
+                                  );
+                                })
+                            ) : (
+                              <div className="alert alert-warning">
+                                <p className="mb-0">⚠️ No criteria defined for this presentation. Please contact coordinator.</p>
+                              </div>
+                            )}
+
+                            {/* Save Button */}
+                            {criteriaList.length > 0 && !loadingCriteria && (
+                              <div className="d-flex gap-2 mt-3">
+                                <button 
+                                  className="btn btn-primary" 
+                                  onClick={handleSaveGrades} 
+                                  disabled={gradingSaving}
+                                >
+                                  {gradingSaving ? 'Saving...' : '💾 Save Presentation Marks'}
+                                </button>
+                              </div>
+                            )}
+                            {gradingMessage && <p className={'mt-3 ' + (gradingMessage.includes('✅') ? 'text-success' : 'text-danger')}>{gradingMessage}</p>}
+                          </>
+                        )}
+
+                        {!selectedStudent && selectedPresentation && (
+                          <div className="alert alert-info mt-3">
+                            <p className="mb-0">👆 Please select a student to start grading.</p>
+                          </div>
+                        )}
+
+                        {!selectedPresentation && (
+                          <div className="alert alert-info mt-3">
+                            <p className="mb-0">👆 Please select a presentation to start grading.</p>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="text-muted">No presentations available.</p>
+                    )}
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+        {/* ==================== END PRESENTATIONS SECTION ==================== */}
+      </div>
+
+      {/* ==================== PROJECT DETAILS MODAL WITH MENTOR COMMENT ==================== */}
+      {showProjectDetailsModal && selectedProject && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 1000
+        }} onClick={() => setShowProjectDetailsModal(false)}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '8px',
+            padding: '30px',
+            width: '90%',
+            maxWidth: '600px',
+            maxHeight: '80vh',
+            overflow: 'auto',
+            boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+          }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h5 style={{ margin: 0 }}>{selectedProject.title}</h5>
+              <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowProjectDetailsModal(false)}>
+                ✕
+              </button>
+            </div>
+            <hr />
+            <div>
+              {/* Project Details */}
+              <div className="mb-3">
+                <p><strong>Status:</strong> {selectedProject.status}</p>
+                <p><strong>Project Type:</strong> {selectedProject.project_type_name || 'N/A'}</p>
+                <p><strong>Year:</strong> {selectedProject.year}</p>
+                <p><strong>Students:</strong> {getProjectStudents(selectedProject.id).join(', ') || 'No students assigned'}</p>
+              </div>
+
+              <div className="mb-3">
+                <p><strong>Main Objective:</strong> {selectedProject.main_objective || 'N/A'}</p>
+              </div>
+
+              <div className="mb-3">
+                <p><strong>Specific Objectives:</strong></p>
+                {Array.isArray(selectedProject.specific_objectives) && selectedProject.specific_objectives.length > 0 ? (
+                  <ul>
+                    {selectedProject.specific_objectives.map((obj, idx) => (
+                      <li key={idx}>{obj}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>N/A</p>
+                )}
+              </div>
+
+              <div className="mb-3">
+                <p><strong>Project Description:</strong> {selectedProject.project_description || 'N/A'}</p>
+              </div>
+
+              <div className="mb-3">
+                <p><strong>Implementation Details:</strong> {selectedProject.implementation_details || 'N/A'}</p>
+              </div>
+
+              {/* ====== MENTOR COMMENT - KWA PROJECT, SIO FLAGGED ====== */}
+              <div className="mb-3">
+                <label className="form-label"><strong>💬 Mentor Comment</strong></label>
+                <textarea
+                  className="form-control"
+                  rows="3"
+                  value={mentorComment}
+                  onChange={(e) => setMentorComment(e.target.value)}
+                  placeholder="Enter your feedback or comment about this project..."
+                  style={{ resize: 'vertical' }}
+                />
+                <small className="text-muted">
+                  This comment will be visible to the student.
+                </small>
+                {commentMessage && (
+                  <p className={'mt-2 ' + (commentMessage.includes('✅') ? 'text-success' : 'text-danger')}>
+                    {commentMessage}
+                  </p>
+                )}
+              </div>
+              {/* ====== END MENTOR COMMENT ====== */}
+
+              {/* Similar Projects - Only show if flagged */}
+              {selectedProject.is_flagged_duplicate && (
+                <div className="mb-3">
+                  <h6>🔍 Similar Projects</h6>
+                  {loadingSimilar ? (
+                    <p>Loading similar projects...</p>
+                  ) : similarProjects.length > 0 ? (
+                    <div className="list-group">
+                      {similarProjects.map((similarProject) => (
+                        <div key={similarProject.id} className="list-group-item">
+                          <div className="d-flex justify-content-between align-items-start">
+                            <div className="flex-grow-1">
+                              <h6 className="mb-1">{similarProject.title}</h6>
+                              <p className="mb-1">
+                                <strong>Similarity:</strong> {(similarProject.similarity_score * 100).toFixed(1)}% |
+                                <strong> Status:</strong> {similarProject.status} |
+                                <strong> Year:</strong> {similarProject.year}
+                              </p>
+                              <small className="text-muted">
+                                Students: {getProjectStudents(similarProject.id).join(', ') || 'No students assigned'}
+                              </small>
+                              {similarProject.reviewed && (
+                                <div className="mt-2">
+                                  <span className="badge bg-success">Reviewed</span>
+                                </div>
+                              )}
+                            </div>
+                            <div className="d-flex flex-column gap-2">
+                              {!similarProject.reviewed && (
+                                <button
+                                  className="btn btn-sm btn-outline-primary"
+                                  onClick={() => markFlagReviewed(similarProject.flag_id)}
+                                >
+                                  Mark Reviewed
+                                </button>
+                              )}
+                              <button
+                                className="btn btn-sm btn-outline-info"
+                                onClick={() => {
+                                  setShowProjectDetailsModal(false);
+                                  setTimeout(() => openProjectDetails(similarProject), 100);
+                                }}
+                              >
+                                View Details
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-muted">No similar projects found.</p>
+                  )}
+                </div>
+              )}
+
+              {/* Status Update */}
+              <div className="mb-3">
+                <label className="form-label"><strong>Change Status</strong></label>
+                <select
+                  className="form-select"
+                  value={selectedProject.status}
+                  onChange={(e) => handleProjectStatusChange(selectedProject.id, e.target.value)}
+                  disabled={projectSaving}
+                >
+                  {STATUS_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {projectMessage && <p className={'mt-3 ' + (projectMessage.includes('✅') ? 'text-success' : 'text-danger')}>{projectMessage}</p>}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default MentorDashboard;

@@ -1,0 +1,135 @@
+/* Dashboard Styles */
+.dashboard-container {
+  min-height: 100vh;
+  background-color: white;
+  color: black;
+  padding-top: 70px;
+  padding-bottom: 40px;
+}
+
+.navbar {
+  background-color: white !important;
+  color: black !important;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  padding: 1rem 0;
+}
+
+.navbar-brand {
+  color: black !important;
+  font-size: 1.5rem;
+  font-weight: bold;
+  letter-spacing: 0.5px;
+}
+
+.btn-outline-light {
+  color: black !important;
+  border-color: black !important;
+}
+
+.btn-outline-light:hover {
+  background-color: black !important;
+  color: white !important;
+}
+
+.welcome-section {
+  background: white;
+  padding: 40px;
+  border-radius: 10px;
+  margin-bottom: 30px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+}
+
+.welcome-section h1 {
+  font-size: 2.5rem;
+  font-weight: bold;
+  margin-bottom: 10px;
+  color: black;
+}
+
+.role-name {
+  font-weight: bold;
+  color: black;
+}
+
+.welcome-section .lead {
+  color: black;
+  margin-bottom: 0;
+}
+
+.dashboard-card {
+  background: white;
+  border: 1px solid #ddd;
+  border-radius: 10px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+  margin-bottom: 20px;
+  transition: all 0.3s ease;
+  height: 100%;
+}
+
+.dashboard-card:hover {
+  transform: translateY(-5px);
+  box-shadow: 0 5px 20px rgba(0, 0, 0, 0.1);
+}
+
+.dashboard-card .card-body {
+  padding: 30px 20px;
+}
+
+.dashboard-card .card-title {
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 15px;
+  color: black;
+}
+
+.dashboard-card .card-text {
+  color: black;
+  margin-bottom: 20px;
+  font-size: 0.95rem;
+}
+
+.dashboard-card .btn {
+  background-color: #e0e8f1dc;
+  border-color: #ffffff;
+  color: rgb(0, 0, 0);
+  width: auto;
+  padding: 6px 12px;
+  border-radius: 5px;
+  font-weight: 500;
+  font-size: 0.9rem;
+  transition: all 0.3s ease;
+}
+
+.dashboard-card .btn:hover {
+  background-color: #0056b3;
+  border-color: #0056b3;
+}
+
+/* Loading State */
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-size: 1.5rem;
+  color: black;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .welcome-section {
+    padding: 20px;
+  }
+
+  .welcome-section h1 {
+    font-size: 1.8rem;
+  }
+
+  .dashboard-card .card-body {
+    padding: 20px 15px;
+  }
+
+  .navbar-brand {
+    font-size: 1.2rem;
+  }
+}
