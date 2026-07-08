@@ -14,7 +14,7 @@ from django.contrib.auth import authenticate
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from django.utils import timezone
-from django.db import models
+from django.db import models as django_models
 
 from accounts.models import User
 from projects.models import Project, ProjectType, ProjectUser, DuplicateFlag, Presentation, PresentationResult
@@ -172,11 +172,12 @@ class ProjectViewSet(viewsets.ModelViewSet):
     ViewSet for managing projects.
     - list: Get all projects
     - retrieve: Get specific project
-    - create: Submit new project
-    - update: Update project (owner or admin)
+    - create: Submit new project (AUTO duplicate check)
+    - update: Update project (AUTO duplicate check)
     - destroy: Delete project (owner or admin)
     - duplicate_check: Manually trigger duplicate detection for a project
-    - similar: Get similar projects with mentor comments (NEW)
+    - similar: Get similar projects with mentor comments
+    - similar-all: Get ALL similar projects (both sides of flag) - UNIQUE
     """
     queryset = Project.objects.all().order_by('-created_at')
     serializer_class = ProjectSerializer
@@ -187,79 +188,115 @@ class ProjectViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
+        
+        # Kama hajaingia, rudisha empty (usalama)
         if not user.is_authenticated:
+            return Project.objects.none()
+        
+        # Superuser au staff wanaona zote
+        if user.is_superuser or user.is_staff:
             return Project.objects.all().order_by('-created_at')
+        
+        # Student anaona projects zake TU (sio za wengine)
         if user.role == 'student':
-            # Student can see their own projects AND projects that are flagged as duplicates
             return Project.objects.filter(
-                models.Q(user=user) | 
-                models.Q(project_users__user=user) |
-                models.Q(is_flagged_duplicate=True)  # Allow students to see flagged projects
+                django_models.Q(user=user) | 
+                django_models.Q(project_users__user=user)
             ).distinct().order_by('-created_at')
-        else:
-            return Project.objects.all().order_by('-created_at')
+        
+        # Mentor, coordinator wanaona zote
+        return Project.objects.all().order_by('-created_at')
     
     def get_object(self):
         obj = super().get_object()
         user = self.request.user
 
-        # Allow access if user is not a student, or if project belongs to user, or if project is flagged as duplicate
-        if not user.is_authenticated or user.role != 'student':
+        if not user.is_authenticated:
+            raise PermissionDenied("Authentication required.")
+        
+        # Superuser au staff wanaona zote
+        if user.is_superuser or user.is_staff:
             return obj
         
-        # Student can access if they own the project, are a member, or the project is flagged as duplicate
-        if ProjectUser.objects.filter(project=obj, user=user).exists() or obj.user_id == user.id or obj.is_flagged_duplicate:
-            return obj
-
-        raise PermissionDenied("You do not have permission to access this project.")
+        # Student anaweza kuona project yake TU
+        if user.role == 'student':
+            if ProjectUser.objects.filter(project=obj, user=user).exists() or obj.user_id == user.id:
+                return obj
+            raise PermissionDenied("You do not have permission to access this project.")
+        
+        # Mentor, coordinator wanaona zote
+        return obj
     
+    # ============================================================
+    # ====== PERFORM_CREATE - AUTO DUPLICATE CHECK ======
+    # ============================================================
     def perform_create(self, serializer):
+        """Create project and automatically check for duplicates"""
+        # ====== STEP 1: Save project first ======
         project = serializer.save(user=self.request.user)
+        logger.info(f"📌 Project {project.id} created: {project.title}")
 
-        try:
-            scorer = get_similarity_scorer()
-            
-            # Use safe_to_list for all embeddings
-            title_emb = safe_to_list(project.title_embedding)
-            obj_emb = safe_to_list(project.objectives_embedding)
-            combined_emb = safe_to_list(project.combined_embedding)
-            
-            similar_projects = scorer.find_similar_projects(
-                project_id=project.id,
-                title=project.title,
-                objectives=f"{project.main_objective} {project.specific_objectives}",
-                title_embedding=title_emb,
-                objectives_embedding=obj_emb,
-                combined_embedding=combined_emb,
-                limit=5
-            )
+        # ====== STEP 2: Run duplicate check ======
+        self._run_duplicate_check(project)
 
-            for similar in similar_projects:
-                if similar['auto_flag']:
-                    DuplicateFlag.objects.create(
-                        project=project,
-                        similar_project_id=similar['id'],
-                        similarity_score=similar['hybrid_similarity'],
-                        flagged_by=None
-                    )
-                    project.is_flagged_duplicate = True
-                    project.duplicate_check_score = similar['hybrid_similarity']
-                    project.save(update_fields=['is_flagged_duplicate', 'duplicate_check_score'])
-                    break
-
-        except Exception as e:
-            logger.error(f"Failed to auto-check duplicates for project {project.id}: {e}")
+    # ============================================================
+    # ====== PERFORM_UPDATE - AUTO DUPLICATE CHECK ======
+    # ============================================================
+    def perform_update(self, serializer):
+        """Update project and automatically re-check for duplicates"""
+        # Get the existing project instance
+        project = self.get_object()
         
-    @action(detail=True, methods=['post'])
-    def duplicate_check(self, request, pk=None):
+        # ====== STEP 1: Save updated project ======
+        updated_project = serializer.save()
+        logger.info(f"🔄 Project {updated_project.id} updated: {updated_project.title}")
+
+        # ====== STEP 2: Regenerate embeddings if content changed ======
+        # Check if important fields changed
+        fields_to_check = ['title', 'main_objective', 'project_description', 'specific_objectives']
+        content_changed = False
+        
+        for field in fields_to_check:
+            old_value = getattr(project, field)
+            new_value = getattr(updated_project, field)
+            if old_value != new_value:
+                content_changed = True
+                break
+        
+        if content_changed:
+            from projects.utils import generate_project_embeddings
+            embeddings = generate_project_embeddings(
+                title=updated_project.title,
+                objectives=updated_project.main_objective,
+                description=updated_project.project_description
+            )
+            
+            if embeddings:
+                updated_project.title_embedding = embeddings.get('title_embedding')
+                updated_project.objectives_embedding = embeddings.get('objectives_embedding')
+                updated_project.combined_embedding = embeddings.get('combined_embedding')
+                updated_project.last_similarity_check = timezone.now()
+                updated_project.save(update_fields=[
+                    'title_embedding', 'objectives_embedding', 
+                    'combined_embedding', 'last_similarity_check'
+                ])
+                logger.info(f"✅ Regenerated embeddings for project {updated_project.id}")
+            else:
+                logger.warning(f"❌ Failed to regenerate embeddings for project {updated_project.id}")
+
+        # ====== STEP 3: Run duplicate check ======
+        self._run_duplicate_check(updated_project)
+
+    # ============================================================
+    # ====== COMMON DUPLICATE CHECK FUNCTION ======
+    # ============================================================
+    def _run_duplicate_check(self, project):
         """
-        Manually trigger duplicate detection for a project.
-        Generates embeddings if they don't exist, then checks for similar projects.
+        Common function to run duplicate check for a project.
+        Used by both create and update operations.
         """
         try:
-            project = self.get_object()
-            
-            # Generate embeddings if they don't exist
+            # ====== STEP 1: Generate embeddings if missing ======
             if project.combined_embedding is None:
                 from projects.utils import generate_project_embeddings
                 embeddings = generate_project_embeddings(
@@ -267,79 +304,163 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     objectives=project.main_objective,
                     description=project.project_description
                 )
-                
                 if embeddings:
                     project.title_embedding = embeddings.get('title_embedding')
                     project.objectives_embedding = embeddings.get('objectives_embedding')
                     project.combined_embedding = embeddings.get('combined_embedding')
                     project.last_similarity_check = timezone.now()
-                    project.save()
-                    logger.info(f"✅ Generated embeddings for project {project.id} during duplicate check")
+                    project.save(update_fields=[
+                        'title_embedding', 'objectives_embedding', 
+                        'combined_embedding', 'last_similarity_check'
+                    ])
+                    logger.info(f"✅ Generated embeddings for project {project.id}")
                 else:
-                    return Response({
-                        'error': 'Failed to generate embeddings for this project',
-                        'project_id': project.id
-                    }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Get similarity scorer
-            scorer = get_similarity_scorer()
-            
-            # Convert embeddings to lists using safe_to_list
-            title_emb = safe_to_list(project.title_embedding)
-            obj_emb = safe_to_list(project.objectives_embedding)
-            combined_emb = safe_to_list(project.combined_embedding)
-            
-            if combined_emb is None:
-                return Response({
-                    'error': 'No combined embedding available for this project',
-                    'project_id': project.id
-                }, status=status.HTTP_400_BAD_REQUEST)
-            
-            # Find similar projects
-            similar_projects = scorer.find_similar_projects(
-                project_id=project.id,
-                title=project.title,
-                objectives=f"{project.main_objective} {project.specific_objectives}",
-                title_embedding=title_emb,
-                objectives_embedding=obj_emb,
-                combined_embedding=combined_emb,
-                limit=10
-            )
-            
-            # Create duplicate flags for auto-flagged projects
-            auto_flagged = []
-            for similar in similar_projects:
-                if similar.get('auto_flag', False):
-                    flag, created = DuplicateFlag.objects.get_or_create(
-                        project=project,
-                        similar_project_id=similar['id'],
-                        defaults={
-                            'similarity_score': similar['hybrid_similarity'],
-                        }
-                    )
-                    if created:
-                        auto_flagged.append(similar)
-            
-            # Update project status
-            if auto_flagged:
+                    logger.warning(f"❌ Failed to generate embeddings for project {project.id}")
+                    return
+
+            # ====== STEP 2: Get settings ======
+            settings = SystemSettings.get_solo()
+            auto_flag_threshold = settings.duplicate_auto_flag_threshold or 0.5
+
+            # ====== STEP 3: Find similar projects using pgvector ======
+            try:
+                from pgvector.django import CosineDistance
+                
+                similar_projects = Project.objects.exclude(id=project.id).exclude(
+                    combined_embedding__isnull=True
+                ).annotate(
+                    distance=CosineDistance('combined_embedding', project.combined_embedding)
+                ).filter(
+                    distance__lt=1 - 0.3  # Threshold ya kuangalia
+                ).order_by('distance')[:10]
+                
+            except Exception as e:
+                logger.error(f"pgvector error: {e}")
+                similar_projects = []
+
+            # ====== STEP 4: Check for duplicates ======
+            max_similarity = 0.0
+            best_match = None
+            matched_keywords = []
+
+            for match in similar_projects:
+                similarity = 1 - match.distance
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_match = match
+
+            # ====== STEP 5: Keyword matching for better accuracy ======
+            if best_match and max_similarity >= 0.3:
+                text1 = f"{project.title} {project.main_objective} {project.project_description or ''}"
+                text2 = f"{best_match.title} {best_match.main_objective} {best_match.project_description or ''}"
+                keywords1 = set(extract_keywords(text1))
+                keywords2 = set(extract_keywords(text2))
+                common = keywords1.intersection(keywords2)
+                matched_keywords = list(common)[:10]
+
+            # ====== STEP 6: Flag if duplicate found ======
+            if best_match and max_similarity >= auto_flag_threshold:
+                # Create or update duplicate flag
+                flag, created = DuplicateFlag.objects.get_or_create(
+                    project=project,
+                    similar_project=best_match,
+                    defaults={
+                        'similarity_score': max_similarity,
+                    }
+                )
+                
+                if not created:
+                    flag.similarity_score = max_similarity
+                    flag.save()
+                
+                # ====== FLAG CURRENT PROJECT ======
                 project.is_flagged_duplicate = True
-                project.save(update_fields=['is_flagged_duplicate'])
-            
-            if similar_projects:
-                max_similarity = max(s['hybrid_similarity'] for s in similar_projects)
                 project.duplicate_check_score = max_similarity
-                project.save(update_fields=['duplicate_check_score'])
+                project.duplicate_keywords_matched = matched_keywords
+                project.last_similarity_check = timezone.now()
+                
+                Project.objects.filter(id=project.id).update(
+                    is_flagged_duplicate=True,
+                    duplicate_check_score=max_similarity,
+                    duplicate_keywords_matched=matched_keywords,
+                    last_similarity_check=timezone.now()
+                )
+                
+                # ====== ALSO FLAG THE SIMILAR PROJECT (BOTH SIDES) ======
+                try:
+                    similar_project = Project.objects.get(id=best_match.id)
+                    if not similar_project.is_flagged_duplicate:
+                        flag2, created2 = DuplicateFlag.objects.get_or_create(
+                            project=similar_project,
+                            similar_project_id=project.id,
+                            defaults={
+                                'similarity_score': max_similarity,
+                            }
+                        )
+                        if created2:
+                            similar_project.is_flagged_duplicate = True
+                            similar_project.duplicate_check_score = max_similarity
+                            similar_project.save(update_fields=[
+                                'is_flagged_duplicate', 'duplicate_check_score'
+                            ])
+                            logger.info(f"✅ Also flagged similar project {similar_project.id}")
+                except Project.DoesNotExist:
+                    pass
+                
+                logger.info(f"🚨 Project {project.id} FLAGGED! Score: {max_similarity:.3f}")
+                
+            else:
+                # ====== HAKUNA DUPLICATE - RESET FLAG ======
+                project.is_flagged_duplicate = False
+                project.duplicate_check_score = max_similarity if max_similarity > 0 else None
+                project.duplicate_keywords_matched = matched_keywords if matched_keywords else []
+                project.last_similarity_check = timezone.now()
+                
+                Project.objects.filter(id=project.id).update(
+                    is_flagged_duplicate=False,
+                    duplicate_check_score=project.duplicate_check_score,
+                    duplicate_keywords_matched=project.duplicate_keywords_matched,
+                    last_similarity_check=timezone.now()
+                )
+                
+                # Delete existing flags for this project
+                DuplicateFlag.objects.filter(project=project).delete()
+                
+                if max_similarity > 0:
+                    logger.info(f"📊 Project {project.id} similarity: {max_similarity:.3f} (below threshold)")
+                else:
+                    logger.info(f"✅ Project {project.id} no duplicates found")
+
+        except Exception as e:
+            logger.error(f"Error in duplicate check for project {project.id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ============================================================
+    # ====== MANUAL DUPLICATE CHECK (BUTTON) ======
+    # ============================================================
+    @action(detail=True, methods=['post'])
+    def duplicate_check(self, request, pk=None):
+        """
+        Manually trigger duplicate detection for a project.
+        (Hii ni kwa ajili ya button ya "Check Duplicates" - bado inabaki)
+        """
+        try:
+            project = self.get_object()
             
-            project.last_similarity_check = timezone.now()
-            project.save(update_fields=['last_similarity_check'])
+            # Run duplicate check
+            self._run_duplicate_check(project)
+            
+            # Refresh project data
+            project.refresh_from_db()
             
             return Response({
                 'project_id': project.id,
                 'project_title': project.title,
-                'similar_projects': similar_projects,
-                'auto_flagged_count': len(auto_flagged),
-                'total_similar': len(similar_projects),
-                'is_flagged': project.is_flagged_duplicate
+                'is_flagged': project.is_flagged_duplicate,
+                'duplicate_check_score': project.duplicate_check_score,
+                'duplicate_keywords_matched': project.duplicate_keywords_matched,
+                'message': 'Duplicate check completed successfully'
             })
             
         except Exception as e:
@@ -360,71 +481,25 @@ class ProjectViewSet(viewsets.ModelViewSet):
         else:
             projects = Project.objects.filter(id__in=project_ids)
         
-        scorer = get_similarity_scorer()
         results = []
         total_auto_flagged = 0
         
         for project in projects:
             try:
-                # Generate embeddings if needed
-                if project.combined_embedding is None:
-                    from projects.utils import generate_project_embeddings
-                    embeddings = generate_project_embeddings(
-                        title=project.title,
-                        objectives=project.main_objective,
-                        description=project.project_description
-                    )
-                    if embeddings:
-                        project.title_embedding = embeddings.get('title_embedding')
-                        project.objectives_embedding = embeddings.get('objectives_embedding')
-                        project.combined_embedding = embeddings.get('combined_embedding')
-                        project.save()
-                
-                title_emb = safe_to_list(project.title_embedding)
-                obj_emb = safe_to_list(project.objectives_embedding)
-                combined_emb = safe_to_list(project.combined_embedding)
-
-                similar_projects = scorer.find_similar_projects(
-                    project_id=project.id,
-                    title=project.title,
-                    objectives=f"{project.main_objective} {project.specific_objectives}",
-                    title_embedding=title_emb,
-                    objectives_embedding=obj_emb,
-                    combined_embedding=combined_emb,
-                    limit=5
-                )
-                
-                auto_flagged = 0
-                for similar in similar_projects:
-                    if similar.get('auto_flag', False):
-                        flag, created = DuplicateFlag.objects.get_or_create(
-                            project=project,
-                            similar_project_id=similar['id'],
-                            defaults={
-                                'similarity_score': similar['hybrid_similarity'],
-                            }
-                        )
-                        if created:
-                            auto_flagged += 1
-                            total_auto_flagged += 1
-                            project.is_flagged_duplicate = True
-                            project.save(update_fields=['is_flagged_duplicate'])
-                
-                if similar_projects:
-                    max_similarity = max(s['hybrid_similarity'] for s in similar_projects)
-                    project.duplicate_check_score = max_similarity
-                    project.save(update_fields=['duplicate_check_score'])
-                
-                project.last_similarity_check = timezone.now()
-                project.save(update_fields=['last_similarity_check'])
+                # Run duplicate check for each project
+                self._run_duplicate_check(project)
+                project.refresh_from_db()
                 
                 results.append({
                     'project_id': project.id,
                     'project_title': project.title,
-                    'similar_projects_found': len(similar_projects),
-                    'auto_flagged': auto_flagged,
+                    'is_flagged': project.is_flagged_duplicate,
+                    'score': project.duplicate_check_score,
                     'processed': True
                 })
+                
+                if project.is_flagged_duplicate:
+                    total_auto_flagged += 1
                 
             except Exception as e:
                 logger.error(f"Failed to process project {project.id}: {e}")
@@ -468,7 +543,7 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     # ============================================================
-    # NEW ACTION: Get similar projects with mentor comments
+    # ====== GET SIMILAR PROJECTS WITH MENTOR COMMENTS ======
     # ============================================================
     @action(detail=True, methods=['get'], url_path='similar')
     def similar_projects(self, request, pk=None):
@@ -549,7 +624,127 @@ class ProjectViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # ============================================================
-    # Alternative: Similar projects with advanced search
+    # ====== GET ALL SIMILAR PROJECTS (BOTH SIDES) - UNIQUE ======
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='similar-all')
+    def similar_all(self, request, pk=None):
+        """
+        Get ALL similar projects for a given project.
+        Hii inarudisha projects zote ambazo zimefanana na project hii
+        kutoka pande zote mbili za DuplicateFlag.
+        
+        ====== FIX: Inaondoa duplicates ======
+        """
+        try:
+            project = self.get_object()
+            
+            # Get all duplicate flags for this project (both sides)
+            flags = DuplicateFlag.objects.filter(
+                Q(project=project) | Q(similar_project=project)
+            ).select_related('project', 'similar_project', 'project__user', 'similar_project__user')
+            
+            if not flags.exists():
+                return Response({
+                    'count': 0,
+                    'results': [],
+                    'project_id': project.id,
+                    'message': 'No similar projects found'
+                })
+            
+            # ====== USE SET TO AVOID DUPLICATES ======
+            seen_project_ids = set()
+            similar_projects_data = []
+            
+            for flag in flags:
+                # Determine which project is the "other" one
+                if flag.project.id == project.id:
+                    other_project = flag.similar_project
+                else:
+                    other_project = flag.project
+                
+                # ====== SKIP IF ALREADY SEEN ======
+                if other_project.id in seen_project_ids:
+                    continue
+                seen_project_ids.add(other_project.id)
+                
+                # Get author name
+                author_name = "Unknown"
+                if other_project.user:
+                    name_parts = [
+                        other_project.user.first_name or '',
+                        other_project.user.middle_name or '',
+                        other_project.user.last_name or ''
+                    ]
+                    author_name = ' '.join(filter(None, name_parts)).strip() or other_project.user.username or "Unknown"
+                
+                # Get mentor name
+                mentor_name = "N/A"
+                if other_project.user and other_project.user.mentor:
+                    mentor = other_project.user.mentor
+                    name_parts = [
+                        mentor.first_name or '',
+                        mentor.middle_name or '',
+                        mentor.last_name or ''
+                    ]
+                    mentor_name = ' '.join(filter(None, name_parts)).strip() or mentor.username or "N/A"
+                
+                # Get mentor comment
+                mentor_comment = other_project.mentor_comment if other_project.mentor_comment else None
+                
+                # Get project type name
+                project_type_name = "N/A"
+                if other_project.project_type:
+                    project_type_name = other_project.project_type.name
+                
+                # ====== GET REGISTRATION NUMBERS ======
+                registration_numbers = []
+                project_users = ProjectUser.objects.filter(project=other_project).select_related('user')
+                for pu in project_users:
+                    if pu.user and pu.user.registration_number:
+                        registration_numbers.append(pu.user.registration_number)
+                
+                similar_projects_data.append({
+                    'id': other_project.id,
+                    'title': other_project.title or 'Untitled',
+                    'description': other_project.project_description or '',
+                    'author_name': author_name,
+                    'mentor': mentor_name,
+                    'mentor_comment': mentor_comment,
+                    'similarity_score': flag.similarity_score,
+                    'status': other_project.status or 'proposed',
+                    'year': other_project.year,
+                    'project_type_name': project_type_name,
+                    'flag_id': flag.id,
+                    'reviewed': flag.reviewed,
+                    'flag_created_at': flag.created_at,
+                    'registration_numbers': registration_numbers,
+                })
+            
+            # Sort by similarity score (highest first)
+            similar_projects_data.sort(key=lambda x: x['similarity_score'] or 0, reverse=True)
+            
+            return Response({
+                'count': len(similar_projects_data),
+                'results': similar_projects_data,
+                'project_id': project.id,
+                'project_title': project.title
+            })
+            
+        except Project.DoesNotExist:
+            return Response({
+                'error': 'Project not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error fetching all similar projects: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({
+                'error': str(e),
+                'results': []
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # ============================================================
+    # ====== ADVANCED SIMILAR PROJECTS ======
     # ============================================================
     @action(detail=True, methods=['get'], url_path='similar-advanced')
     def similar_projects_advanced(self, request, pk=None):
@@ -636,6 +831,43 @@ class ProjectViewSet(viewsets.ModelViewSet):
         except Exception as e:
             logger.error(f"Error in advanced similarity: {e}")
             return self.similar_projects(request, pk)
+
+
+# ============================================================
+# ====== HELPER FUNCTION FOR KEYWORD EXTRACTION ======
+# ============================================================
+
+def extract_keywords(text):
+    """
+    Extract keywords from text for duplicate detection.
+    Removes stop words and common words.
+    """
+    # Common stop words
+    stop_words = {
+        'the', 'a', 'an', 'of', 'for', 'on', 'at', 'to', 'in', 'with', 'by', 'from',
+        'up', 'off', 'out', 'over', 'under', 'about', 'after', 'before', 'between',
+        'among', 'through', 'during', 'without', 'against', 'within', 'upon', 'into',
+        'and', 'or', 'but', 'nor', 'for', 'so', 'yet', 'as', 'than', 'that', 'these',
+        'those', 'this', 'that', 'these', 'those', 'is', 'am', 'are', 'was', 'were',
+        'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+        'would', 'shall', 'should', 'may', 'might', 'must', 'can', 'could', 'use',
+        'using', 'system', 'application', 'web', 'mobile', 'project', 'development'
+    }
+    
+    if not text:
+        return []
+    
+    # Split and clean
+    words = str(text).lower().split()
+    keywords = []
+    
+    for word in words:
+        # Remove punctuation
+        word = ''.join(c for c in word if c.isalnum())
+        if len(word) > 3 and word not in stop_words:
+            keywords.append(word)
+    
+    return keywords
 
 
 # ============================================================
@@ -828,6 +1060,41 @@ class DuplicateFlagViewSet(viewsets.ModelViewSet):
     permission_classes = [AllowAny]
     filterset_fields = ['reviewed', 'project', 'similar_project']
     
+    def get_queryset(self):
+        """
+        Override to filter flags based on user permissions.
+        Students can only see flags for their own projects.
+        """
+        queryset = super().get_queryset()
+        user = self.request.user
+        
+        if not user.is_authenticated:
+            return DuplicateFlag.objects.none()
+        
+        if user.role == 'student':
+            # Student can only see flags for their own projects
+            # Get all project IDs that belong to this student
+            project_ids = Project.objects.filter(
+                django_models.Q(user=user) | django_models.Q(project_users__user=user)
+            ).values_list('id', flat=True)
+            
+            # Filter flags where project OR similar_project belongs to student
+            queryset = queryset.filter(
+                Q(project_id__in=project_ids) | Q(similar_project_id__in=project_ids)
+            )
+        elif user.role == 'mentor':
+            # Mentor can see flags for their students' projects
+            student_ids = User.objects.filter(mentor_id=user.id).values_list('id', flat=True)
+            project_ids = Project.objects.filter(
+                Q(user_id__in=student_ids) | Q(project_users__user_id__in=student_ids)
+            ).values_list('id', flat=True)
+            queryset = queryset.filter(
+                Q(project_id__in=project_ids) | Q(similar_project_id__in=project_ids)
+            )
+        # Coordinator and staff can see all flags
+        
+        return queryset
+    
     @action(detail=True, methods=['post'])
     def mark_reviewed(self, request, pk=None):
         duplicate_flag = self.get_object()
@@ -925,9 +1192,8 @@ class PresentationResultCriteriaViewSet(viewsets.ModelViewSet):
 
 
 # ============================================================
-# END CRITERIA VIEWSETS
+# ====== AUTHENTICATION VIEWS ======
 # ============================================================
-
 
 @api_view(['POST'])
 @csrf_exempt

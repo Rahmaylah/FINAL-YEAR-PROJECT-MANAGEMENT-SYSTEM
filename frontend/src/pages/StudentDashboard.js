@@ -117,6 +117,7 @@ function StudentDashboard() {
         const individualResponse = await axios.get(`/api/projects/${projectData.id}/`);
         console.log('📌 Individual Project Response:', individualResponse.data);
         console.log('💬 mentor_comment from individual:', individualResponse.data.mentor_comment);
+        console.log('🔍 is_flagged_duplicate:', individualResponse.data.is_flagged_duplicate);
         
         return individualResponse.data;
       }
@@ -138,6 +139,7 @@ function StudentDashboard() {
         if (freshProjectData) {
           console.log('📌 === SETTING PROJECT WITH FRESH DATA ===');
           console.log('💬 mentor_comment:', freshProjectData.mentor_comment);
+          console.log('🔍 is_flagged_duplicate:', freshProjectData.is_flagged_duplicate);
           setProject(freshProjectData);
           
           // Initialize form with existing project data
@@ -242,7 +244,9 @@ function StudentDashboard() {
     }
   }, [user]);
 
-  // Function to fetch similar projects using duplicate-flags endpoint
+  // ============================================================
+  // FETCH SIMILAR PROJECTS - USING NEW similar-all ENDPOINT
+  // ============================================================
   const fetchSimilarProjects = async () => {
     // Only fetch if project exists
     if (!project || !project.id) {
@@ -257,89 +261,38 @@ function StudentDashboard() {
     setSimilarProjects([]);
 
     try {
-      const flagsResponse = await axios.get(`/api/duplicate-flags/?project=${project.id}`);
-
-      let flags = [];
-      if (flagsResponse.data.results) {
-        flags = flagsResponse.data.results;
-      } else if (Array.isArray(flagsResponse.data)) {
-        flags = flagsResponse.data;
-      }
-
-      if (flags.length === 0) {
+      // ====== USE NEW ENDPOINT: /api/projects/{id}/similar-all/ ======
+      const response = await axios.get(`/api/projects/${project.id}/similar-all/`);
+      console.log('🔍 === SIMILAR PROJECTS RESPONSE ===');
+      console.log('Response:', response.data);
+      
+      if (response.data.count === 0 || !response.data.results || response.data.results.length === 0) {
         setSimilarProjects([]);
-        setSimilarError('No similar projects found');
+        setSimilarError(response.data.message || 'No similar projects found');
         setSimilarProjectsExpanded(true);
         setLoadingSimilar(false);
         return;
       }
 
-      const similarProjectsData = [];
-      for (const flag of flags) {
-        try {
-          const projectResponse = await axios.get(`/api/projects/${flag.similar_project}/`);
-          const projectData = projectResponse.data;
-          
-          let mentorName = 'N/A';
-          let mentorComment = null;
-          
-          // Check if project has mentor_info
-          if (projectData.mentor_info) {
-            mentorName = `${projectData.mentor_info.first_name || ''} ${projectData.mentor_info.last_name || ''}`.trim() || 'Mentor';
-          }
-          
-          // Check for mentor comment from flag or project data
-          if (flag.mentor_comment) {
-            mentorComment = flag.mentor_comment;
-          } else if (projectData.mentor_comment) {
-            mentorComment = projectData.mentor_comment;
-          }
+      // Format the data for display
+      const formattedProjects = response.data.results.map((item) => ({
+        id: item.id,
+        title: item.title || 'Untitled Project',
+        description: item.description || '',
+        author_name: item.author_name || 'Unknown',
+        mentor: item.mentor || 'N/A',
+        mentor_comment: item.mentor_comment || null,
+        similarity_score: item.similarity_score ? `${(item.similarity_score * 100).toFixed(1)}%` : 'N/A',
+        status: item.status || 'N/A',
+        flag_id: item.flag_id,
+        reviewed: item.reviewed || false,
+        year: item.year || 'N/A',
+        project_type_name: item.project_type_name || 'N/A'
+      }));
 
-          let authorName = 'Unknown';
-          if (projectData.author_name) {
-            authorName = projectData.author_name;
-          } else if (projectData.student_name) {
-            authorName = projectData.student_name;
-          } else if (projectData.user) {
-            // If user is an object, get name
-            if (typeof projectData.user === 'object' && projectData.user !== null) {
-              const userObj = projectData.user;
-              const nameParts = [userObj.first_name || '', userObj.middle_name || '', userObj.last_name || ''];
-              authorName = nameParts.filter(Boolean).join(' ') || userObj.username || 'Unknown';
-            } else {
-              authorName = String(projectData.user);
-            }
-          }
-
-          similarProjectsData.push({
-            id: projectData.id,
-            title: projectData.title || 'Untitled Project',
-            description: projectData.project_description || projectData.description || '',
-            author_name: authorName,
-            mentor: mentorName,
-            mentor_comment: mentorComment,
-            similarity_score: flag.similarity_score ? `${(flag.similarity_score * 100).toFixed(1)}%` : 'N/A',
-            status: projectData.status || 'N/A',
-            flag_id: flag.id,
-            reviewed: flag.reviewed || false,
-            year: projectData.year || 'N/A',
-            project_type_name: projectData.project_type_name || projectData.project_type?.name || 'N/A'
-          });
-        } catch (err) {
-          // Handle 404 gracefully - project might be deleted or inaccessible
-          if (err.response && err.response.status === 404) {
-            console.warn(`⚠️ Project ${flag.similar_project} not found, skipping...`);
-          } else {
-            console.error(`Error fetching project ${flag.similar_project}:`, err);
-          }
-        }
-      }
-
-      setSimilarProjects(similarProjectsData);
-      if (similarProjectsData.length === 0) {
-        setSimilarError('Could not load similar projects');
-      }
+      setSimilarProjects(formattedProjects);
       setSimilarProjectsExpanded(true);
+      
     } catch (error) {
       console.error('Error fetching similar projects:', error);
       if (error.response) {
@@ -375,13 +328,17 @@ function StudentDashboard() {
       const response = await axios.post(`/api/projects/${project.id}/duplicate_check/`);
       console.log('Duplicate check result:', response.data);
       
+      if (response.data.is_flagged) {
+        alert(`⚠️ Your project has been flagged as a potential duplicate!\nSimilarity score: ${(response.data.duplicate_check_score * 100).toFixed(1)}%`);
+      } else {
+        alert('✅ No duplicates found for your project.');
+      }
+      
       // Refresh project data to get updated status
       const freshData = await fetchFreshProjectData();
       if (freshData) {
         setProject(freshData);
       }
-      
-      alert('✅ Duplicate check completed successfully!');
       
       // Refresh similar projects
       await fetchSimilarProjects();
@@ -537,15 +494,27 @@ function StudentDashboard() {
         response = await axios.post('/api/projects/', projectData);
       }
 
-      setProject(response.data);
+      // ====== REFRESH PROJECT DATA AFTER SAVE ======
+      const freshData = await fetchFreshProjectData();
+      if (freshData) {
+        setProject(freshData);
+      } else {
+        setProject(response.data);
+      }
+      
       setIsEditing(false);
-      alert('✅ Project saved successfully!');
+      
+      if (response.data.is_flagged_duplicate) {
+        alert(`⚠️ Your project has been flagged as a potential duplicate!\nSimilarity score: ${(response.data.duplicate_check_score * 100).toFixed(1)}%`);
+      } else {
+        alert('✅ Project saved successfully!');
+      }
       
       // Refresh similar projects after save
       if (response.data.id) {
         setTimeout(() => {
           fetchSimilarProjects();
-        }, 1000);
+        }, 1500);
       }
     } catch (error) {
       console.error('Error saving project:', error);
@@ -948,19 +917,23 @@ function StudentDashboard() {
                     <span className={`badge ${project.status === 'approved' ? 'bg-success' : project.status === 'rejected' ? 'bg-danger' : project.status === 'completed' ? 'bg-info' : 'bg-secondary'}`}>
                       {project.status}
                     </span>
-                    {project.is_flagged_duplicate && (
-                      <span className="badge bg-warning text-dark">⚠️ Flagged as Duplicate</span>
+                    
+                    {/* ====== DUPLICATE FLAG STATUS ====== */}
+                    {project.is_flagged_duplicate ? (
+                      <span className="badge bg-danger">
+                        ⚠️ Flagged as Duplicate
+                        {project.duplicate_check_score && (
+                          <span className="ms-1">({(project.duplicate_check_score * 100).toFixed(1)}%)</span>
+                        )}
+                      </span>
+                    ) : (
+                      project.duplicate_check_score !== null && project.duplicate_check_score !== undefined && (
+                        <span className="badge bg-success">✅ Not Flagged</span>
+                      )
                     )}
                   </div>
                   
-                  {/* ====== DEBUGGING CONSOLE.LOG ====== */}
-                  {console.log('🔍 === RENDERING MENTOR COMMENT ===')}
-                  {console.log('🔍 project.mentor_comment value:', project.mentor_comment)}
-                  {console.log('🔍 project.mentor_comment type:', typeof project.mentor_comment)}
-                  {console.log('🔍 Is it truthy?', !!project.mentor_comment)}
-                  {console.log('🔍 Is it not empty?', project.mentor_comment && project.mentor_comment.trim() !== '')}
-                  
-                  {/* ====== MENTOR COMMENT - Inaonyeshwa hapa chini ya status ====== */}
+                  {/* ====== MENTOR COMMENT - Inaonyeshwa chini ya status ====== */}
                   {project.mentor_comment && project.mentor_comment.trim() !== '' && (
                     <div className="mt-3 p-3 bg-light rounded border-start border-primary border-4">
                       <strong>💬 Mentor Comment:</strong>
@@ -1050,6 +1023,16 @@ function StudentDashboard() {
                           {simProject.mentor && simProject.mentor !== 'N/A' && (
                             <div className="mt-1">
                               <small className="text-muted">👨‍🏫 Mentor: {simProject.mentor}</small>
+                            </div>
+                          )}
+                          
+                          {/* ====== SHOW MENTOR COMMENT FOR SIMILAR PROJECT ====== */}
+                          {simProject.mentor_comment && (
+                            <div className="mt-2 p-2 bg-light rounded border-start border-warning border-3">
+                              <small>
+                                <strong>💬 Mentor Comment:</strong>
+                                <span className="ms-1">{simProject.mentor_comment}</span>
+                              </small>
                             </div>
                           )}
                           

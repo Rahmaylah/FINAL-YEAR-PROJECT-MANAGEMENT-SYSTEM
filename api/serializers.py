@@ -139,7 +139,7 @@ class DuplicateFlagSerializer(serializers.ModelSerializer):
     project_registration_numbers = serializers.SerializerMethodField()
     similar_project_registration_numbers = serializers.SerializerMethodField()
     
-    # ====== NEW FIELDS FOR SIMILAR PROJECT INFO ======
+    # ====== FIELDS FOR SIMILAR PROJECT INFO ======
     similar_project_author = serializers.SerializerMethodField()
     similar_project_mentor = serializers.SerializerMethodField()
     similar_project_description = serializers.CharField(source='similar_project.project_description', read_only=True, default='')
@@ -147,7 +147,7 @@ class DuplicateFlagSerializer(serializers.ModelSerializer):
     similar_project_status = serializers.CharField(source='similar_project.status', read_only=True, default='')
     similar_project_type = serializers.CharField(source='similar_project.project_type.name', read_only=True, default='')
     
-    # ====== NEW: Mentor comment on duplicate flag ======
+    # ====== Mentor comment on duplicate flag ======
     mentor_comment = serializers.CharField(allow_blank=True, required=False)
     
     def get_reviewed_by_name(self, obj):
@@ -278,7 +278,9 @@ class ProjectSimilarSerializer(serializers.ModelSerializer):
             'mentor', 
             'mentor_comment', 
             'similarity_score',
-            'status'
+            'status',
+            'year',
+            'project_type_name'
         ]
     
     def get_author_name(self, obj):
@@ -290,7 +292,7 @@ class ProjectSimilarSerializer(serializers.ModelSerializer):
                 user = project_user.user
                 name_parts = [user.first_name or '', user.middle_name or '', user.last_name or '']
                 return ' '.join(filter(None, name_parts)).strip() or user.username or 'Unknown Student'
-        except Exception as e:
+        except Exception:
             pass
         
         # Fallback: try to get from user field
@@ -314,7 +316,7 @@ class ProjectSimilarSerializer(serializers.ModelSerializer):
                 user = project_user.user
                 name_parts = [user.first_name or '', user.middle_name or '', user.last_name or '']
                 return ' '.join(filter(None, name_parts)).strip() or user.username or 'No mentor assigned'
-        except Exception as e:
+        except Exception:
             pass
         
         # Fallback: try to get from user.mentor
@@ -334,7 +336,6 @@ class ProjectSimilarSerializer(serializers.ModelSerializer):
         # Check if project has direct mentor_comment field
         if hasattr(obj, 'mentor_comment') and obj.mentor_comment:
             return obj.mentor_comment
-        
         return None
     
     def get_description(self, obj):
@@ -359,6 +360,7 @@ class ProjectSimilarSerializer(serializers.ModelSerializer):
 # ============================================================
 # MAIN PROJECT SERIALIZER WITH AUTHOR AND MENTOR INFO
 # ============================================================
+# ====== SULUHISHO: mentor_comment INAWEZA KUANDIKWA ======
 
 class ProjectSerializer(serializers.ModelSerializer):
     project_type = serializers.PrimaryKeyRelatedField(queryset=ProjectType.objects.all(), allow_null=True, required=False)
@@ -366,10 +368,19 @@ class ProjectSerializer(serializers.ModelSerializer):
     documents = serializers.SerializerMethodField()
     presentation_results = serializers.SerializerMethodField()
     
-    # ====== FIELDS ======
+    # ====== AUTHOR FIELDS ======
     author_name = serializers.SerializerMethodField()
     mentor_info = serializers.SerializerMethodField()
-    mentor_comment = serializers.CharField(allow_blank=True, required=False)
+    
+    # ====== SULUHISHO: mentor_comment HAIPO READ_ONLY ======
+    # Mentor anaweza kuandika (write), student anaweza kusoma (read)
+    mentor_comment = serializers.CharField(
+        allow_blank=True, 
+        required=False, 
+        allow_null=True,
+        help_text="Mentor's feedback on the project"
+    )
+    
     project_users = serializers.SerializerMethodField()
 
     def get_documents(self, obj):
@@ -411,18 +422,40 @@ class ProjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Project
         fields = [
-            'id', 'title', 'project_type', 'project_type_name', 
-            'main_objective', 'specific_objectives', 'project_description', 
-            'implementation_details', 'year', 'status',
-            'is_flagged_duplicate', 'duplicate_check_score', 'duplicate_keywords_matched',
-            'created_at', 'updated_at', 
-            'documents', 'presentation_results',
-            'author_name', 'mentor_info', 'mentor_comment', 'project_users'
+            'id', 
+            'title', 
+            'project_type', 
+            'project_type_name', 
+            'main_objective', 
+            'specific_objectives', 
+            'project_description', 
+            'implementation_details', 
+            'year', 
+            'status',
+            'is_flagged_duplicate', 
+            'duplicate_check_score', 
+            'duplicate_keywords_matched',
+            'created_at', 
+            'updated_at', 
+            'documents', 
+            'presentation_results',
+            'author_name', 
+            'mentor_info', 
+            'mentor_comment',  # ← HII NDIYO MENTOR COMMENT
+            'project_users'
         ]
         read_only_fields = [
-            'title_embedding', 'objectives_embedding', 'combined_embedding', 
-            'last_similarity_check', 'documents', 'presentation_results',
-            'author_name', 'mentor_info', 'project_users'
+            'title_embedding', 
+            'objectives_embedding', 
+            'combined_embedding', 
+            'last_similarity_check', 
+            'documents', 
+            'presentation_results',
+            'author_name', 
+            'mentor_info',
+            # ====== SULUHISHO: ONDOA mentor_comment KWA READ_ONLY ======
+            # 'mentor_comment',  # ← HII IMEONDOKA!
+            'project_users'
         ]
 
 

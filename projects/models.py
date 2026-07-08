@@ -438,13 +438,10 @@ def generate_embeddings_before_save(sender, instance, **kwargs):
     This ensures embeddings are always available.
     """
     try:
-        # ====== FIXED: Check if combined_embedding exists ======
-        # If combined_embedding already exists, skip embedding generation
-        # This allows saving mentor_comment without regenerating embeddings
+        # Check if combined_embedding already exists
         if instance.combined_embedding is not None:
             logger.info(f"⏭️ Skipping embedding generation for project {instance.id} (embeddings already exist)")
             return
-        # ====== END OF FIX ======
         
         from .utils import generate_project_embeddings
         
@@ -477,12 +474,27 @@ def check_duplicates_after_save(sender, instance, created, **kwargs):
     Inafanya kazi kwa CREATE na UPDATE (EDIT)
     """
     try:
-        # ====== FIXED: Skip duplicate check if no combined embedding ======
-        # If combined_embedding doesn't exist, skip duplicate check
+        # Skip duplicate check if no combined embedding
         if instance.combined_embedding is None:
             logger.info(f"⏭️ Skipping duplicate check for project {instance.id} (no embedding)")
+            # Try to generate embeddings if this is a new project
+            if created:
+                from .utils import generate_project_embeddings
+                embeddings = generate_project_embeddings(
+                    title=instance.title,
+                    objectives=instance.main_objective,
+                    description=instance.project_description
+                )
+                if embeddings:
+                    instance.title_embedding = embeddings.get('title_embedding')
+                    instance.objectives_embedding = embeddings.get('objectives_embedding')
+                    instance.combined_embedding = embeddings.get('combined_embedding')
+                    instance.last_similarity_check = timezone.now()
+                    instance.save(update_fields=['title_embedding', 'objectives_embedding', 'combined_embedding', 'last_similarity_check'])
+                    logger.info(f"✅ Generated embeddings for new project {instance.id} via post_save")
+                    # Re-run duplicate check now that we have embeddings
+                    return check_duplicates_after_save(sender, instance, created, **kwargs)
             return
-        # ====== END OF FIX ======
         
         from .similarity import get_similarity_scorer
         from core.models import SystemSettings

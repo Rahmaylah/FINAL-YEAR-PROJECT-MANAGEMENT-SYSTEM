@@ -70,6 +70,8 @@ function MentorDashboard() {
   const [mentorComment, setMentorComment] = useState('');
   const [commentSaving, setCommentSaving] = useState(false);
   const [commentMessage, setCommentMessage] = useState('');
+  // ==================== SELECTED STATUS STATE ====================
+  const [selectedStatus, setSelectedStatus] = useState('');
 
   // Image error fallback
   const [imageError, setImageError] = useState(false);
@@ -228,15 +230,40 @@ function MentorDashboard() {
     }));
   };
 
-  // Save grades
+  // ==================== SAVE GRADES WITH PROPER VALIDATION ====================
   const handleSaveGrades = async () => {
-    if (!selectedPresentation || !selectedStudent) {
-      setGradingMessage('❌ Please select both presentation and student.');
+    // ====== VALIDATION ======
+    if (!selectedPresentation) {
+      setGradingMessage('❌ Please select a presentation.');
+      return;
+    }
+
+    if (!selectedStudent) {
+      setGradingMessage('❌ Please select a student.');
       return;
     }
 
     if (criteriaList.length === 0) {
       setGradingMessage('❌ No criteria available for this presentation.');
+      return;
+    }
+
+    // ====== CHECK IF ALL REQUIRED CRITERIA ARE GRADED ======
+    const missingCriteria = [];
+    for (const criteria of criteriaList) {
+      if (criteria.is_required) {
+        const scoreData = gradingScores[criteria.id] || {};
+        const hasScore = scoreData.score !== undefined && scoreData.score !== '' && scoreData.score !== null;
+        const hasOption = scoreData.selected_option && scoreData.selected_option !== '';
+        
+        if (!hasScore && !hasOption) {
+          missingCriteria.push(criteria.name);
+        }
+      }
+    }
+
+    if (missingCriteria.length > 0) {
+      setGradingMessage('❌ Please grade all required criteria: ' + missingCriteria.join(', '));
       return;
     }
 
@@ -266,11 +293,12 @@ function MentorDashboard() {
       // Save each criteria score
       const scores = Object.entries(gradingScores).map(([criteriaId, data]) => ({
         criteria_id: parseInt(criteriaId),
-        score: data.score !== undefined && data.score !== '' ? parseFloat(data.score) : null,
+        score: data.score !== undefined && data.score !== '' && data.score !== null ? parseFloat(data.score) : null,
         selected_option: data.selected_option || '',
         comment: data.comment || ''
       }));
 
+      // ====== SAVE EACH SCORE ======
       for (const scoreData of scores) {
         // Check if score already exists
         const existingResponse = await axios.get('/api/presentation-result-criteria/?result=' + resultId + '&criteria=' + scoreData.criteria_id);
@@ -295,8 +323,12 @@ function MentorDashboard() {
         }
       }
 
-      // Calculate total
+      // ====== CALCULATE TOTAL ======
       await axios.post('/api/presentation-results/' + resultId + '/calculate_total/');
+      
+      // ====== REFRESH DATA ======
+      const refreshedResult = await axios.get('/api/presentation-results/' + resultId + '/');
+      setGradingResult(refreshedResult.data);
       
       setGradingMessage('✅ Grades saved successfully!');
       setTimeout(() => {
@@ -312,6 +344,12 @@ function MentorDashboard() {
           errorMsg = '❌ ' + error.response.data.error;
         } else if (error.response.data?.detail) {
           errorMsg = '❌ ' + error.response.data.detail;
+        } else if (error.response.data && typeof error.response.data === 'object') {
+          // Handle field validation errors
+          const errors = Object.values(error.response.data).flat();
+          if (errors.length > 0) {
+            errorMsg = '❌ ' + errors.join(', ');
+          }
         }
       }
       setGradingMessage(errorMsg);
@@ -435,17 +473,21 @@ function MentorDashboard() {
       try {
         const response = await axios.get('/api/projects/' + project.id + '/');
         setSelectedProject(response.data);
-        // Reset comment fields
-        setMentorComment('');
+        // Set current status and comment
+        setSelectedStatus(response.data.status || 'proposed');
+        setMentorComment(response.data.mentor_comment || '');
         setCommentMessage('');
+        setProjectMessage('');
       } catch (error) {
         console.error('Error loading project details:', error);
         setSelectedProject(project);
+        setSelectedStatus(project.status || 'proposed');
+        setMentorComment(project.mentor_comment || '');
       }
     };
     loadProjectDetails();
     setShowProjectDetailsModal(true);
-    // Fetch similar projects if flagged, but comment is ALWAYS on the project itself
+    // Fetch similar projects if flagged
     if (project.is_flagged_duplicate) {
       fetchSimilarProjects(project.id);
     } else {
@@ -501,58 +543,92 @@ function MentorDashboard() {
     }
   };
 
-  // ==================== UPDATED: Handle Project Status Change with Comment ====================
-  const handleProjectStatusChange = async (projectId, newStatus) => {
+  // ==================== UPDATED: Handle Save Comment and Status with BUTTON ====================
+  const handleSaveCommentAndStatus = async () => {
+    if (!selectedProject || !selectedProject.id) {
+      setProjectMessage('❌ No project selected.');
+      return;
+    }
+
     setProjectSaving(true);
-    setProjectMessage('');
     setCommentSaving(true);
-    
+    setProjectMessage('');
+    setCommentMessage('');
+
     try {
-      // Update project status
-      const statusResponse = await axios.patch('/api/projects/' + projectId + '/', { 
-        status: newStatus 
-      });
-      
-      // If there's a mentor comment, save it to the project (NOT to flagged)
-      if (mentorComment.trim()) {
-        await axios.patch('/api/projects/' + projectId + '/', {
-          mentor_comment: mentorComment.trim()
-        });
+      const updates = {};
+      let hasChanges = false;
+
+      // Check if status changed
+      if (selectedStatus !== selectedProject.status) {
+        updates.status = selectedStatus;
+        hasChanges = true;
       }
+
+      // Check if comment changed
+      const currentComment = selectedProject.mentor_comment || '';
+      if (mentorComment.trim() !== currentComment.trim()) {
+        updates.mentor_comment = mentorComment.trim();
+        hasChanges = true;
+      }
+
+      if (!hasChanges) {
+        setProjectMessage('ℹ️ No changes to save.');
+        setCommentMessage('ℹ️ No changes to save.');
+        setProjectSaving(false);
+        setCommentSaving(false);
+        return;
+      }
+
+      // Save all updates in one request
+      const response = await axios.patch('/api/projects/' + selectedProject.id + '/', updates);
       
       // Update local projects state
       setProjects((prevProjects) =>
         prevProjects.map((project) =>
-          project.id === projectId ? { 
+          project.id === selectedProject.id ? { 
             ...project, 
-            ...statusResponse.data, 
-            mentor_comment: mentorComment.trim() || project.mentor_comment 
+            ...response.data 
           } : project
         )
       );
       
       // Update selected project
-      setSelectedProject((prev) => prev ? { 
+      setSelectedProject((prev) => ({ 
         ...prev, 
-        ...statusResponse.data,
-        mentor_comment: mentorComment.trim() || prev.mentor_comment 
-      } : prev);
+        ...response.data 
+      }));
       
-      setProjectMessage('✅ Project status updated successfully!');
-      if (mentorComment.trim()) {
-        setCommentMessage('✅ Comment saved successfully!');
+      // Update current status
+      setSelectedStatus(response.data.status);
+      
+      // Show success messages
+      if (updates.status) {
+        setProjectMessage('✅ Status updated successfully!');
+      } else {
+        setProjectMessage('✅ Project updated successfully!');
       }
       
-      // Clear comment after successful save
+      if (updates.mentor_comment !== undefined) {
+        setCommentMessage('✅ Comment saved successfully!');
+      }
+
+      // Clear messages after delay
       setTimeout(() => {
-        setMentorComment('');
         setCommentMessage('');
         setProjectMessage('');
-      }, 3000);
+      }, 4000);
       
     } catch (error) {
-      console.error('Error updating project:', error);
-      setProjectMessage('❌ Unable to update project status. Please try again.');
+      console.error('Error saving project updates:', error);
+      
+      let errorMsg = '❌ Unable to save. Please try again.';
+      if (error.response?.data?.error) {
+        errorMsg = '❌ ' + error.response.data.error;
+      } else if (error.response?.data?.detail) {
+        errorMsg = '❌ ' + error.response.data.detail;
+      }
+      setProjectMessage(errorMsg);
     } finally {
       setProjectSaving(false);
       setCommentSaving(false);
@@ -1150,7 +1226,7 @@ function MentorDashboard() {
                               </div>
                             )}
 
-                            {/* Save Button */}
+                            {/* ====== SAVE GRADES BUTTON ====== */}
                             {criteriaList.length > 0 && !loadingCriteria && (
                               <div className="d-flex gap-2 mt-3">
                                 <button 
@@ -1158,7 +1234,14 @@ function MentorDashboard() {
                                   onClick={handleSaveGrades} 
                                   disabled={gradingSaving}
                                 >
-                                  {gradingSaving ? 'Saving...' : '💾 Save Presentation Marks'}
+                                  {gradingSaving ? (
+                                    <>
+                                      <span className="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+                                      Saving...
+                                    </>
+                                  ) : (
+                                    '💾 Save Presentation Marks'
+                                  )}
                                 </button>
                               </div>
                             )}
@@ -1190,7 +1273,7 @@ function MentorDashboard() {
         {/* ==================== END PRESENTATIONS SECTION ==================== */}
       </div>
 
-      {/* ==================== PROJECT DETAILS MODAL WITH MENTOR COMMENT ==================== */}
+      {/* ==================== PROJECT DETAILS MODAL WITH MENTOR COMMENT AND STATUS ==================== */}
       {showProjectDetailsModal && selectedProject && (
         <div style={{
           position: 'fixed',
@@ -1209,7 +1292,7 @@ function MentorDashboard() {
             borderRadius: '8px',
             padding: '30px',
             width: '90%',
-            maxWidth: '600px',
+            maxWidth: '650px',
             maxHeight: '80vh',
             overflow: 'auto',
             boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
@@ -1255,27 +1338,88 @@ function MentorDashboard() {
                 <p><strong>Implementation Details:</strong> {selectedProject.implementation_details || 'N/A'}</p>
               </div>
 
-              {/* ====== MENTOR COMMENT - KWA PROJECT, SIO FLAGGED ====== */}
-              <div className="mb-3">
-                <label className="form-label"><strong>💬 Mentor Comment</strong></label>
-                <textarea
-                  className="form-control"
-                  rows="3"
-                  value={mentorComment}
-                  onChange={(e) => setMentorComment(e.target.value)}
-                  placeholder="Enter your feedback or comment about this project..."
-                  style={{ resize: 'vertical' }}
-                />
-                <small className="text-muted">
-                  This comment will be visible to the student.
-                </small>
-                {commentMessage && (
-                  <p className={'mt-2 ' + (commentMessage.includes('✅') ? 'text-success' : 'text-danger')}>
-                    {commentMessage}
+              {/* ============================================================ */}
+              {/* ====== MENTOR COMMENT AND STATUS - WITH SAVE BUTTON ====== */}
+              {/* ============================================================ */}
+              <div className="mb-3 p-3 bg-light rounded border">
+                <h6 className="mb-3">✏️ Mentor Review</h6>
+
+                {/* Status Selection */}
+                <div className="mb-3">
+                  <label className="form-label"><strong>Status</strong></label>
+                  <select
+                    className="form-select"
+                    value={selectedStatus}
+                    onChange={(e) => setSelectedStatus(e.target.value)}
+                    disabled={projectSaving}
+                  >
+                    {STATUS_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Mentor Comment Textarea */}
+                <div className="mb-3">
+                  <label className="form-label"><strong>💬 Mentor Comment</strong></label>
+                  <textarea
+                    className="form-control"
+                    rows="4"
+                    value={mentorComment}
+                    onChange={(e) => setMentorComment(e.target.value)}
+                    placeholder="Enter your feedback or comment about this project..."
+                    style={{ resize: 'vertical' }}
+                    disabled={commentSaving}
+                  />
+                  <small className="text-muted">
+                    This comment will be visible to the student.
+                  </small>
+                  {commentMessage && (
+                    <p className={'mt-2 ' + (commentMessage.includes('✅') ? 'text-success' : 'text-danger')}>
+                      {commentMessage}
+                    </p>
+                  )}
+                </div>
+
+                {/* ====== SAVE BUTTON ====== */}
+                <div className="d-flex gap-2">
+                  <button 
+                    className="btn btn-success" 
+                    onClick={handleSaveCommentAndStatus} 
+                    disabled={projectSaving || commentSaving}
+                  >
+                    {projectSaving || commentSaving ? (
+                      <>
+                        <span className="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>
+                        Saving...
+                      </>
+                    ) : (
+                      '💾 Save Comment & Status'
+                    )}
+                  </button>
+                  <button 
+                    className="btn btn-outline-secondary" 
+                    onClick={() => {
+                      // Reset to current values
+                      setSelectedStatus(selectedProject.status || 'proposed');
+                      setMentorComment(selectedProject.mentor_comment || '');
+                      setCommentMessage('');
+                      setProjectMessage('');
+                    }}
+                    disabled={projectSaving || commentSaving}
+                  >
+                    Reset
+                  </button>
+                </div>
+                {projectMessage && (
+                  <p className={'mt-2 ' + (projectMessage.includes('✅') ? 'text-success' : projectMessage.includes('ℹ️') ? 'text-info' : 'text-danger')}>
+                    {projectMessage}
                   </p>
                 )}
               </div>
-              {/* ====== END MENTOR COMMENT ====== */}
+              {/* ====== END MENTOR COMMENT AND STATUS ====== */}
 
               {/* Similar Projects - Only show if flagged */}
               {selectedProject.is_flagged_duplicate && (
@@ -1332,25 +1476,6 @@ function MentorDashboard() {
                   )}
                 </div>
               )}
-
-              {/* Status Update */}
-              <div className="mb-3">
-                <label className="form-label"><strong>Change Status</strong></label>
-                <select
-                  className="form-select"
-                  value={selectedProject.status}
-                  onChange={(e) => handleProjectStatusChange(selectedProject.id, e.target.value)}
-                  disabled={projectSaving}
-                >
-                  {STATUS_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              {projectMessage && <p className={'mt-3 ' + (projectMessage.includes('✅') ? 'text-success' : 'text-danger')}>{projectMessage}</p>}
             </div>
           </div>
         </div>

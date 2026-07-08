@@ -30,17 +30,20 @@ class SimilarityScorer:
     def __init__(self, embedding_service=None):
         self._embedding_service = embedding_service
 
+        # ====== FIXED: Lower thresholds for better duplicate detection ======
         # Load configuration from settings, but avoid failing when Django settings are not initialized.
         if getattr(settings, 'configured', False):
             self.semantic_weight = getattr(settings, 'DUPLICATE_SEMANTIC_WEIGHT', 0.7)
             self.lexical_weight = getattr(settings, 'DUPLICATE_LEXICAL_WEIGHT', 0.3)
-            self.similarity_threshold = getattr(settings, 'DUPLICATE_SIMILARITY_THRESHOLD', 0.6)
-            self.auto_flag_threshold = getattr(settings, 'DUPLICATE_AUTO_FLAG_THRESHOLD', 0.8)
+            self.similarity_threshold = getattr(settings, 'DUPLICATE_SIMILARITY_THRESHOLD', 0.4)  # ← 40%
+            self.auto_flag_threshold = getattr(settings, 'DUPLICATE_AUTO_FLAG_THRESHOLD', 0.5)    # ← 50%
         else:
             self.semantic_weight = 0.7
             self.lexical_weight = 0.3
-            self.similarity_threshold = 0.6
-            self.auto_flag_threshold = 0.8
+            self.similarity_threshold = 0.4   # ← 40%
+            self.auto_flag_threshold = 0.5    # ← 50%
+        # ====== END OF FIX ======
+        
         self.search_years_back = getattr(settings, 'DUPLICATE_SEARCH_YEARS_BACK', 3) if getattr(settings, 'configured', False) else 3
         self.algorithm = getattr(settings, 'DUPLICATE_ALGORITHM', 'HYBRID') if getattr(settings, 'configured', False) else 'HYBRID'
 
@@ -172,7 +175,19 @@ class SimilarityScorer:
 
         try:
             with connection.cursor() as cursor:
-                # Use PostgreSQL's similarity function (requires pg_trgm extension)
+                # ====== FIXED: Check if pg_trgm extension exists ======
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'
+                    )
+                """)
+                has_trgm = cursor.fetchone()[0]
+                
+                if not has_trgm:
+                    logger.warning("pg_trgm extension not available, using fallback")
+                    return self._fallback_lexical_similarity(text1, text2)
+                # ====== END OF FIX ======
+                
                 cursor.execute("""
                     SELECT similarity(%s, %s)
                 """, [text1, text2])
@@ -347,6 +362,10 @@ class SimilarityScorer:
                             logger.warning(f"Failed to calculate hybrid similarity: {e}")
                             hybrid_sim = float(vec_sim) if vec_sim is not None else 0.0
 
+                        # ====== FIXED: Auto-flag if similarity >= threshold ======
+                        is_auto_flagged = hybrid_sim >= self.auto_flag_threshold
+                        # ====== END OF FIX ======
+
                         similar_projects.append({
                             'id': proj_id,
                             'title': proj_title,
@@ -354,7 +373,7 @@ class SimilarityScorer:
                             'vector_similarity': float(vec_sim) if vec_sim is not None else None,
                             'hybrid_similarity': hybrid_sim,
                             'is_potential_duplicate': hybrid_sim >= self.similarity_threshold,
-                            'auto_flag': hybrid_sim >= self.auto_flag_threshold
+                            'auto_flag': is_auto_flagged  # ← Now uses the fixed threshold
                         })
 
                     # Sort by hybrid similarity descending
@@ -396,6 +415,19 @@ class SimilarityScorer:
             # First try with pg_trgm
             try:
                 with connection.cursor() as cursor:
+                    # ====== FIXED: Check if pg_trgm exists first ======
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'
+                        )
+                    """)
+                    has_trgm = cursor.fetchone()[0]
+                    
+                    if not has_trgm:
+                        logger.warning("pg_trgm not available, using fallback lexical")
+                        return self._fallback_lexical_search(project_id, combined_text, min_year, limit)
+                    # ====== END OF FIX ======
+                    
                     cursor.execute("""
                         SELECT
                             p.id,
