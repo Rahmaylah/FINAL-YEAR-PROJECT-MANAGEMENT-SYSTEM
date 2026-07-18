@@ -1,4 +1,10 @@
 # projects/models.py - Complete updated file with working auto-duplicate detection
+# ====== FIXED: First project NEVER flagged ======
+# ====== FIXED: duplicate_check_score = None for first project ======
+# ====== FIXED: ALWAYS CREATE DuplicateFlag for flagged projects ======
+# ====== FIXED: COMPLETELY SKIP DUPLICATE CHECK FOR MENTOR UPDATES ======
+# ====== FIXED: Presentation marks save properly ======
+# ====== FIXED: Verify flag exists after creation ======
 # Inafanya kazi kwa CREATE na UPDATE (EDIT)
 
 from django.db import models
@@ -7,10 +13,12 @@ from pgvector.django import VectorField
 from django.db.models.signals import post_save, pre_save
 from django.dispatch import receiver
 from django.utils import timezone
+from django.db.models import Q
 from accounts.models import User
 import logging
 import json
 import re
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +60,7 @@ class Project(models.Model):
     duplicate_check_score = models.FloatField(null=True, blank=True)
     duplicate_keywords_matched = models.JSONField(default=list, blank=True)
 
-    # ====== NEW: Mentor Comment Field ======
+    # ====== Mentor Comment Field ======
     mentor_comment = models.TextField(blank=True, null=True, help_text="Mentor's feedback on the project")
 
     created_at = models.DateTimeField(auto_now_add=True)
@@ -64,6 +72,9 @@ class Project(models.Model):
     def force_duplicate_check(self):
         """
         Force duplicate check manually (useful after editing)
+        ====== FIXED: First project never flagged ======
+        ====== FIXED: duplicate_check_score = None for first project ======
+        ====== FIXED: Auto-create missing flag ======
         """
         from .similarity import get_similarity_scorer
         from core.models import SystemSettings
@@ -93,19 +104,26 @@ class Project(models.Model):
                 last_similarity_check=self.last_similarity_check
             )
         
-        # Find similar projects
+        # Find similar projects - EXCLUDE SAME USER
         similar = Project.objects.exclude(id=self.id).exclude(
             combined_embedding__isnull=True
+        ).exclude(
+            user=self.user  # ← EXCLUDE SAME USER
         ).annotate(
             distance=CosineDistance('combined_embedding', self.combined_embedding)
         ).filter(
             distance__lt=1 - threshold
         ).order_by('distance')[:5]
         
+        # ====== FIX: Check if this is the FIRST project ======
+        older_projects = Project.objects.filter(
+            Q(user=self.user) | Q(project_users__user=self.user)
+        ).exclude(id=self.id).filter(created_at__lt=self.created_at).exists()
+        
         # Check duplicates
         for proj in similar:
             similarity = 1 - proj.distance
-            if similarity >= auto_flag_threshold:
+            if similarity >= auto_flag_threshold and older_projects:
                 flag, created = DuplicateFlag.objects.get_or_create(
                     project=self,
                     similar_project=proj,
@@ -124,7 +142,25 @@ class Project(models.Model):
                 )
                 logger.info(f"🚨 Project {self.id} flagged as duplicate after edit! Score: {similarity:.3f}")
                 return True
+            elif similarity >= auto_flag_threshold and not older_projects:
+                # ====== FIRST PROJECT - NEVER FLAGGED ======
+                # ====== FIXED: duplicate_check_score = None ======
+                self.is_flagged_duplicate = False
+                self.duplicate_check_score = None
+                Project.objects.filter(id=self.id).update(
+                    is_flagged_duplicate=False,
+                    duplicate_check_score=None
+                )
+                logger.info(f"✅ FIRST Project {self.id} - NOT FLAGGED (similarity: {similarity:.3f})")
+                return False
         
+        # No duplicates found
+        self.is_flagged_duplicate = False
+        self.duplicate_check_score = None
+        Project.objects.filter(id=self.id).update(
+            is_flagged_duplicate=False,
+            duplicate_check_score=None
+        )
         return False
 
 
@@ -214,6 +250,10 @@ class PresentationCriteria(models.Model):
             return []
         return self.options
 
+
+# ============================================================
+# ====== FIXED: PresentationResult Model with marks ======
+# ============================================================
 
 class PresentationResult(models.Model):
     presentation = models.ForeignKey(Presentation, on_delete=models.CASCADE, related_name='results')
@@ -466,18 +506,111 @@ def generate_embeddings_before_save(sender, instance, **kwargs):
         logger.error(f"Error generating embeddings for {instance.id}: {e}")
 
 
+# ================================================================
+# ====== THREAD-LOCAL FLAG FOR MENTOR UPDATES ======
+# ================================================================
+
+# Thread-local storage for mentor update flag
+_mentor_update_local = threading.local()
+
+def is_mentor_update():
+    """Check if current operation is a mentor update"""
+    return getattr(_mentor_update_local, 'active', False)
+
+def set_mentor_update_active():
+    """Set mentor update flag to active"""
+    _mentor_update_local.active = True
+    logger.info("🔒 MENTOR UPDATE FLAG SET")
+
+def set_mentor_update_inactive():
+    """Set mentor update flag to inactive"""
+    _mentor_update_local.active = False
+    logger.info("🔓 MENTOR UPDATE FLAG CLEARED")
+
+
+# ================================================================
+# ====== POST_SAVE SIGNAL - SKIP FOR MENTOR UPDATES ======
+# ================================================================
+
 @receiver(post_save, sender=Project)
 def check_duplicates_after_save(sender, instance, created, **kwargs):
     """
     Check for duplicate projects AFTER saving.
-    Uses both keyword matching and embedding similarity.
-    Inafanya kazi kwa CREATE na UPDATE (EDIT)
+    ====== FIXED: COMPLETELY SKIP FOR MENTOR UPDATES ======
+    ====== FIXED: ALWAYS CREATE DUPLICATEFLAG ======
+    ====== FIXED: VERIFY FLAG EXISTS ======
     """
     try:
+        # ============================================================
+        # ====== CRITICAL: SKIP IF MENTOR UPDATE IS ACTIVE ======
+        # ============================================================
+        if is_mentor_update():
+            logger.info(f"✅ MENTOR UPDATE ACTIVE - COMPLETELY SKIPPING duplicate check for project {instance.id}")
+            return
+        
+        # ============================================================
+        # ====== SKIP IF ONLY MENTOR FIELDS CHANGED ======
+        # ============================================================
+        if not created:
+            try:
+                old_instance = Project.objects.get(id=instance.id)
+                
+                # Check what changed
+                mentor_fields = ['mentor_comment', 'status']
+                content_fields = ['title', 'main_objective', 'project_description', 'specific_objectives']
+                
+                mentor_changed = False
+                content_changed = False
+                
+                for field in mentor_fields:
+                    if getattr(old_instance, field) != getattr(instance, field):
+                        mentor_changed = True
+                        break
+                
+                for field in content_fields:
+                    if getattr(old_instance, field) != getattr(instance, field):
+                        content_changed = True
+                        break
+                
+                # ====== IF ONLY MENTOR FIELDS CHANGED, SKIP ======
+                if mentor_changed and not content_changed:
+                    logger.info(f"✅ Mentor update (comment/status only) - SKIPPING duplicate check for project {instance.id}")
+                    
+                    # ====== FORCE RESET TO ORIGINAL STATE ======
+                    original_flagged = old_instance.is_flagged_duplicate
+                    original_score = old_instance.duplicate_check_score
+                    
+                    if not original_flagged:
+                        Project.objects.filter(id=instance.id).update(
+                            is_flagged_duplicate=False,
+                            duplicate_check_score=None,
+                            duplicate_keywords_matched=[]
+                        )
+                        DuplicateFlag.objects.filter(project=instance).delete()
+                        DuplicateFlag.objects.filter(similar_project=instance).delete()
+                        logger.info(f"✅ FORCED project {instance.id} to remain UNFLAGGED")
+                    else:
+                        Project.objects.filter(id=instance.id).update(
+                            is_flagged_duplicate=True,
+                            duplicate_check_score=original_score
+                        )
+                        logger.info(f"✅ FORCED project {instance.id} to remain FLAGGED")
+                    
+                    instance.is_flagged_duplicate = original_flagged
+                    instance.duplicate_check_score = original_score
+                    
+                    return
+                    
+            except Project.DoesNotExist:
+                pass
+        
+        # ============================================================
+        # ====== CONTINUE WITH NORMAL DUPLICATE CHECK ======
+        # ============================================================
+        
         # Skip duplicate check if no combined embedding
         if instance.combined_embedding is None:
             logger.info(f"⏭️ Skipping duplicate check for project {instance.id} (no embedding)")
-            # Try to generate embeddings if this is a new project
             if created:
                 from .utils import generate_project_embeddings
                 embeddings = generate_project_embeddings(
@@ -492,170 +625,245 @@ def check_duplicates_after_save(sender, instance, created, **kwargs):
                     instance.last_similarity_check = timezone.now()
                     instance.save(update_fields=['title_embedding', 'objectives_embedding', 'combined_embedding', 'last_similarity_check'])
                     logger.info(f"✅ Generated embeddings for new project {instance.id} via post_save")
-                    # Re-run duplicate check now that we have embeddings
                     return check_duplicates_after_save(sender, instance, created, **kwargs)
             return
         
-        from .similarity import get_similarity_scorer
         from core.models import SystemSettings
         
         # Get settings
         settings = SystemSettings.get_solo()
-        threshold = settings.duplicate_similarity_threshold or 0.5
-        auto_flag_threshold = settings.duplicate_auto_flag_threshold or 0.6
+        auto_flag_threshold = settings.duplicate_auto_flag_threshold or 0.5
         
-        # Get all other projects
-        other_projects = Project.objects.exclude(id=instance.id)
+        # ====== EXCLUDE SAME USER'S PROJECTS ======
+        other_projects = Project.objects.exclude(id=instance.id).exclude(user=instance.user)
         
         if not other_projects.exists():
+            logger.info(f"✅ No other projects to compare for project {instance.id}")
+            instance.is_flagged_duplicate = False
+            instance.duplicate_check_score = None
+            Project.objects.filter(id=instance.id).update(
+                is_flagged_duplicate=False,
+                duplicate_check_score=None,
+                last_similarity_check=timezone.now()
+            )
             return
-        
-        # ====== KEYWORD SIMILARITY ======
-        keyword_matches = []
-        for other in other_projects:
-            keyword_score = check_keyword_similarity(instance, other)
-            if keyword_score > 0.3:  # Minimum threshold for keyword match
-                keyword_matches.append({
-                    'project': other,
-                    'keyword_score': keyword_score
-                })
         
         # ====== EMBEDDING SIMILARITY (pgvector) ======
         try:
             from pgvector.django import CosineDistance
             
-            # Find similar projects using pgvector
             embedding_matches = Project.objects.exclude(id=instance.id).exclude(
                 combined_embedding__isnull=True
+            ).exclude(
+                user=instance.user
             ).annotate(
                 distance=CosineDistance('combined_embedding', instance.combined_embedding)
             ).filter(
-                distance__lt=1 - threshold
+                distance__lt=1 - 0.3
             ).order_by('distance')[:5]
             
         except Exception as e:
             logger.error(f"pgvector error: {e}")
             embedding_matches = []
         
-        # ====== COMBINE RESULTS ======
-        combined_scores = {}
-        matched_keywords = []
+        # ====== CHECK FOR SIMILAR PROJECTS ======
         max_similarity = 0.0
         best_match = None
         
-        # Process embedding matches
         for match in embedding_matches:
             similarity = 1 - match.distance
-            combined_scores[match.id] = {
-                'project': match,
-                'similarity': similarity,
-                'keyword_score': 0.0,
-                'combined_score': similarity
-            }
             if similarity > max_similarity:
                 max_similarity = similarity
                 best_match = match
         
-        # Process keyword matches
-        for match in keyword_matches:
-            proj = match['project']
-            keyword_score = match['keyword_score']
-            
-            if proj.id in combined_scores:
-                # Combine with embedding score
-                current = combined_scores[proj.id]
-                # Average of both scores
-                combined_score = (current['similarity'] + keyword_score) / 2
-                combined_scores[proj.id]['combined_score'] = combined_score
-                combined_scores[proj.id]['keyword_score'] = keyword_score
+        # ====== CHECK IF THIS IS THE FIRST PROJECT ======
+        older_projects = Project.objects.filter(
+            Q(user=instance.user) | Q(project_users__user=instance.user)
+        ).exclude(id=instance.id).filter(created_at__lt=instance.created_at).exists()
+        
+        # ====== DECISION ======
+        should_flag = False
+        
+        if best_match and max_similarity >= auto_flag_threshold:
+            if older_projects:
+                should_flag = True
+                logger.info(f"📌 Project {instance.id} has older projects - FLAGGING")
             else:
-                combined_scores[proj.id] = {
-                    'project': proj,
-                    'similarity': 0.0,
-                    'keyword_score': keyword_score,
-                    'combined_score': keyword_score
-                }
-            
-            # Track matched keywords
-            text1 = f"{instance.title} {instance.main_objective}"
-            text2 = f"{proj.title} {proj.main_objective}"
-            keywords1 = set(extract_keywords(text1))
-            keywords2 = set(extract_keywords(text2))
-            common = keywords1.intersection(keywords2)
-            matched_keywords.extend(list(common)[:5])
+                logger.info(f"✅ Project {instance.id} is FIRST - NOT FLAGGING")
         
-        # ====== FIND BEST MATCH ======
-        best_score = 0.0
-        best_project = None
+        # ============================================================
+        # ====== FIX: ALWAYS CREATE DUPLICATEFLAG ======
+        # ============================================================
         
-        for proj_id, data in combined_scores.items():
-            score = data.get('combined_score', data.get('similarity', data.get('keyword_score', 0)))
-            if score > best_score:
-                best_score = score
-                best_project = data['project']
-        
-        # ====== FLAG IF DUPLICATE FOUND ======
-        flagged = False
-        if best_project and best_score >= auto_flag_threshold:
-            # Create or update duplicate flag
-            flag, created = DuplicateFlag.objects.get_or_create(
+        if best_match and max_similarity >= auto_flag_threshold:
+            # ====== FLAG 1: Current project → Similar project ======
+            flag1, created1 = DuplicateFlag.objects.get_or_create(
                 project=instance,
-                similar_project=best_project,
-                defaults={
-                    'similarity_score': best_score,
-                }
+                similar_project=best_match,
+                defaults={'similarity_score': max_similarity}
             )
             
-            if not created:
-                flag.similarity_score = best_score
-                flag.save()
+            if not created1:
+                flag1.similarity_score = max_similarity
+                flag1.save()
+                logger.info(f"✅ Updated flag1: {instance.id} → {best_match.id}")
+            else:
+                logger.info(f"✅ Created flag1: {instance.id} → {best_match.id}")
             
-            # Update project status
+            # ====== FLAG 2: Similar project → Current project (BOTH SIDES) ======
+            flag2, created2 = DuplicateFlag.objects.get_or_create(
+                project=best_match,
+                similar_project=instance,
+                defaults={'similarity_score': max_similarity}
+            )
+            
+            if not created2:
+                flag2.similarity_score = max_similarity
+                flag2.save()
+                logger.info(f"✅ Updated flag2: {best_match.id} → {instance.id}")
+            else:
+                logger.info(f"✅ Created flag2: {best_match.id} → {instance.id}")
+        
+        # ============================================================
+        # ====== APPLY FLAG BASED ON should_flag ======
+        # ============================================================
+        
+        if best_match and max_similarity >= auto_flag_threshold and should_flag:
+            # ====== SECOND+ PROJECT - FLAG IT ======
             instance.is_flagged_duplicate = True
-            instance.duplicate_check_score = best_score
-            instance.duplicate_keywords_matched = matched_keywords[:10]
+            instance.duplicate_check_score = max_similarity
             
-            # Save without triggering signals
             Project.objects.filter(id=instance.id).update(
                 is_flagged_duplicate=True,
-                duplicate_check_score=best_score,
-                duplicate_keywords_matched=matched_keywords[:10]
+                duplicate_check_score=max_similarity,
+                last_similarity_check=timezone.now()
             )
             
-            flagged = True
-            action = "updated" if not created else "created"
-            logger.info(f"🚨 Project {instance.id} flagged as duplicate! Score: {best_score:.3f}")
-            logger.info(f"   Matched keywords: {matched_keywords[:5]}")
-        
-        elif best_project and best_score > 0:
-            # Not flagged but similar - update score
-            instance.duplicate_check_score = best_score
-            instance.duplicate_keywords_matched = matched_keywords[:10]
+            # Also flag the other project for mentor
+            if not best_match.is_flagged_duplicate:
+                best_match.is_flagged_duplicate = True
+                best_match.duplicate_check_score = max_similarity
+                best_match.save(update_fields=['is_flagged_duplicate', 'duplicate_check_score'])
+                logger.info(f"🔍 Also flagged other project {best_match.id} for mentor")
+            
+            logger.info(f"🚨 SECOND+ Project {instance.id} FLAGGED! Score: {max_similarity:.3f}")
+            
+        elif best_match and max_similarity >= auto_flag_threshold and not should_flag:
+            # ====== FIRST PROJECT - NEVER FLAGGED ======
+            instance.is_flagged_duplicate = False
+            instance.duplicate_check_score = None
+            
             Project.objects.filter(id=instance.id).update(
-                duplicate_check_score=best_score,
-                duplicate_keywords_matched=matched_keywords[:10]
+                is_flagged_duplicate=False,
+                duplicate_check_score=None,
+                last_similarity_check=timezone.now()
             )
-            logger.info(f"📊 Project {instance.id} similarity score: {best_score:.3f} (below flag threshold)")
-        
-        # Update last check time
-        instance.last_similarity_check = timezone.now()
-        Project.objects.filter(id=instance.id).update(
-            last_similarity_check=timezone.now()
-        )
-        
-        # Log action
-        if created:
-            logger.info(f"✅ New project {instance.id} saved and checked for duplicates")
+            
+            logger.info(f"✅ FIRST Project {instance.id} - NOT FLAGGED (flag record exists)")
+            
         else:
-            logger.info(f"🔄 Project {instance.id} updated and re-checked for duplicates")
+            # ====== NO DUPLICATE FOUND - RESET ======
+            instance.is_flagged_duplicate = False
+            instance.duplicate_check_score = None
+            
+            Project.objects.filter(id=instance.id).update(
+                is_flagged_duplicate=False,
+                duplicate_check_score=None,
+                last_similarity_check=timezone.now()
+            )
+            
+            # Delete existing flags
+            DuplicateFlag.objects.filter(project=instance).delete()
+            DuplicateFlag.objects.filter(similar_project=instance).delete()
+            
+            logger.info(f"✅ Project {instance.id} - no duplicates")
+        
+        # ============================================================
+        # ====== FIX: VERIFY FLAG EXISTS ======
+        # ============================================================
+        
+        if instance.is_flagged_duplicate:
+            flag_exists = DuplicateFlag.objects.filter(
+                Q(project=instance) | Q(similar_project=instance)
+            ).exists()
+            
+            if not flag_exists:
+                logger.error(f"❌ Project {instance.id} is flagged but NO DuplicateFlag exists!")
+                
+                # ====== FORCE CREATE THE FLAG ======
+                if best_match:
+                    DuplicateFlag.objects.create(
+                        project=instance,
+                        similar_project=best_match,
+                        similarity_score=instance.duplicate_check_score or max_similarity
+                    )
+                    DuplicateFlag.objects.create(
+                        project=best_match,
+                        similar_project=instance,
+                        similarity_score=instance.duplicate_check_score or max_similarity
+                    )
+                    logger.info(f"✅ FORCE CREATED flags for {instance.id} ↔ {best_match.id}")
+                else:
+                    # Try to find any similar project
+                    try:
+                        from pgvector.django import CosineDistance
+                        similar = Project.objects.exclude(id=instance.id).exclude(
+                            combined_embedding__isnull=True
+                        ).exclude(
+                            user=instance.user
+                        ).annotate(
+                            distance=CosineDistance('combined_embedding', instance.combined_embedding)
+                        ).filter(
+                            distance__lt=1 - 0.3
+                        ).order_by('distance')[:1]
+                        
+                        if similar.exists():
+                            match = similar.first()
+                            similarity = 1 - match.distance
+                            DuplicateFlag.objects.create(
+                                project=instance,
+                                similar_project=match,
+                                similarity_score=similarity
+                            )
+                            DuplicateFlag.objects.create(
+                                project=match,
+                                similar_project=instance,
+                                similarity_score=similarity
+                            )
+                            logger.info(f"✅ FORCE CREATED flags for {instance.id} ↔ {match.id}")
+                    except Exception as e:
+                        logger.error(f"Error force creating flag: {e}")
         
     except Exception as e:
         logger.error(f"Error in duplicate check for project {instance.id}: {e}")
+        import traceback
+        traceback.print_exc()
     
-    # Create ProjectUser if new
     if created:
         ProjectUser.objects.get_or_create(
             project=instance,
             user=instance.user,
             defaults={'role': 'lead'}
         )
+
+
+# ================================================================
+# ====== DISABLE/ENABLE SIGNAL FUNCTIONS ======
+# ================================================================
+
+_duplicate_check_receiver = None
+
+def disable_duplicate_check():
+    """Disable the duplicate check signal"""
+    global _duplicate_check_receiver
+    if _duplicate_check_receiver is None:
+        _duplicate_check_receiver = check_duplicates_after_save
+    post_save.disconnect(_duplicate_check_receiver, sender=Project)
+    logger.info("🔒 DUPLICATE CHECK SIGNAL DISABLED")
+
+def enable_duplicate_check():
+    """Enable the duplicate check signal"""
+    global _duplicate_check_receiver
+    if _duplicate_check_receiver is not None:
+        post_save.connect(_duplicate_check_receiver, sender=Project)
+        logger.info("🔓 DUPLICATE CHECK SIGNAL ENABLED")

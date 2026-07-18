@@ -14,7 +14,7 @@ from django.contrib.auth import authenticate
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from django.utils import timezone
-from django.db import models
+from django.db import models as django_models
 
 from accounts.models import User
 from projects.models import Project, ProjectType, ProjectUser, DuplicateFlag, Presentation, PresentationResult
@@ -172,11 +172,12 @@ class ProjectViewSet(viewsets.ModelViewSet):
     ViewSet for managing projects.
     - list: Get all projects
     - retrieve: Get specific project
-    - create: Submit new project
-    - update: Update project (owner or admin)
+    - create: Submit new project (AUTO duplicate check)
+    - update: Update project (AUTO duplicate check)
     - destroy: Delete project (owner or admin)
     - duplicate_check: Manually trigger duplicate detection for a project
     - similar: Get similar projects with mentor comments
+    - similar-all: Get ALL similar projects (both sides of flag) - UNIQUE
     """
     queryset = Project.objects.all().order_by('-created_at')
     serializer_class = ProjectSerializer
@@ -187,19 +188,33 @@ class ProjectViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        if not user.is_authenticated:
-            return Project.objects.none()  # Return empty if not authenticated
         
-        if user.role == 'student':
-            # Student can ONLY see their OWN projects
-            # and projects they are members of (project_users)
-            return Project.objects.filter(
-                models.Q(user=user) | 
-                models.Q(project_users__user=user)
-            ).distinct().order_by('-created_at')
-        else:
-            # Mentor, coordinator, staff can see all projects
+        # Kama hajaingia, rudisha empty (usalama)
+        if not user.is_authenticated:
+            return Project.objects.none()
+        
+        # Superuser au staff wanaona zote
+        if user.is_superuser or user.is_staff:
             return Project.objects.all().order_by('-created_at')
+        
+        # ====== FIX: Mentor anaona projects zote za students wake ======
+        if user.role == 'mentor':
+            # Get all students under this mentor
+            student_ids = User.objects.filter(mentor_id=user.id).values_list('id', flat=True)
+            return Project.objects.filter(
+                django_models.Q(user_id__in=student_ids) | 
+                django_models.Q(project_users__user_id__in=student_ids)
+            ).distinct().order_by('-created_at')
+        
+        # Student anaona projects zake TU
+        if user.role == 'student':
+            return Project.objects.filter(
+                django_models.Q(user=user) | 
+                django_models.Q(project_users__user=user)
+            ).distinct().order_by('-created_at')
+        
+        # Coordinator na wengine wanaona zote
+        return Project.objects.all().order_by('-created_at')
     
     def get_object(self):
         obj = super().get_object()
@@ -208,131 +223,177 @@ class ProjectViewSet(viewsets.ModelViewSet):
         if not user.is_authenticated:
             raise PermissionDenied("Authentication required.")
         
-        # Allow access if user is not a student
-        if user.role != 'student':
+        # Superuser au staff wanaona zote
+        if user.is_superuser or user.is_staff:
             return obj
         
-        # Student can access if they own the project or are a member
-        if ProjectUser.objects.filter(project=obj, user=user).exists() or obj.user_id == user.id:
-            return obj
-
-        raise PermissionDenied("You do not have permission to access this project.")
+        # ====== FIX: Mentor anaweza kuona project yoyote ya students wake ======
+        if user.role == 'mentor':
+            # Get all student IDs under this mentor
+            student_ids = User.objects.filter(mentor_id=user.id).values_list('id', flat=True)
+            
+            # Check if project belongs to one of mentor's students
+            if obj.user_id in student_ids or ProjectUser.objects.filter(project=obj, user_id__in=student_ids).exists():
+                return obj
+            raise PermissionDenied("You do not have permission to access this project.")
+        
+        # Student anaweza kuona project yake TU
+        if user.role == 'student':
+            if ProjectUser.objects.filter(project=obj, user=user).exists() or obj.user_id == user.id:
+                return obj
+            raise PermissionDenied("You do not have permission to access this project.")
+        
+        # Coordinator wanaona zote
+        return obj
     
+    # ============================================================
+    # ====== PERFORM_CREATE - AUTO DUPLICATE CHECK ======
+    # ============================================================
     def perform_create(self, serializer):
+        """Create project and automatically check for duplicates"""
+        # ====== STEP 1: Save project first ======
         project = serializer.save(user=self.request.user)
+        logger.info(f"Project {project.id} created: {project.title}")
 
-        try:
-            scorer = get_similarity_scorer()
-            
-            # Use safe_to_list for all embeddings
-            title_emb = safe_to_list(project.title_embedding)
-            obj_emb = safe_to_list(project.objectives_embedding)
-            combined_emb = safe_to_list(project.combined_embedding)
-            
-            similar_projects = scorer.find_similar_projects(
-                project_id=project.id,
-                title=project.title,
-                objectives=f"{project.main_objective} {project.specific_objectives}",
-                title_embedding=title_emb,
-                objectives_embedding=obj_emb,
-                combined_embedding=combined_emb,
-                limit=5
-            )
+        # ====== STEP 2: Run duplicate check ======
+        self._run_duplicate_check(project)
 
-            for similar in similar_projects:
-                if similar['auto_flag']:
-                    DuplicateFlag.objects.create(
-                        project=project,
-                        similar_project_id=similar['id'],
-                        similarity_score=similar['hybrid_similarity'],
-                        flagged_by=None
-                    )
-                    project.is_flagged_duplicate = True
-                    project.duplicate_check_score = similar['hybrid_similarity']
-                    project.save(update_fields=['is_flagged_duplicate', 'duplicate_check_score'])
-                    break
-
-        except Exception as e:
-            logger.error(f"Failed to auto-check duplicates for project {project.id}: {e}")
-    
     # ============================================================
-    # ====== UPDATE METHODS - Mentor can update status and comment ======
+    # ====== PERFORM_UPDATE - AUTO DUPLICATE CHECK ======
     # ============================================================
-    
-    def update(self, request, *args, **kwargs):
-        """
-        Update a project - allows partial updates for mentor (status, mentor_comment)
-        """
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        user = request.user
-        
-        # Check if user has permission
-        if user.role not in ['mentor', 'coordinator'] and not user.is_staff:
-            raise PermissionDenied("You do not have permission to update this project.")
-        
-        # Validate and sanitize data
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        
-        # If mentor, only allow status and mentor_comment
-        if user.role == 'mentor':
-            allowed_fields = ['status', 'mentor_comment']
-            for field in request.data.keys():
-                if field not in allowed_fields:
-                    raise PermissionDenied(f"Mentors can only update: {', '.join(allowed_fields)}")
-        
-        self.perform_update(serializer)
-        return Response(serializer.data)
-
     def perform_update(self, serializer):
-        """
-        Perform the actual update - handles mentor updates efficiently
-        """
+        """Update project - SKIP DUPLICATE CHECK FOR MENTOR"""
+        # Get the existing project instance
+        project = self.get_object()
+        
+        # ============================================================
+        # ====== CHECK IF MENTOR IS UPDATING ======
+        # ============================================================
         user = self.request.user
-        instance = serializer.instance
-        validated_data = serializer.validated_data
+        is_mentor = user.role == 'mentor'
+        updated_fields = set(serializer.validated_data.keys())
         
-        # Mentor can update status and mentor_comment
-        if user.role == 'mentor':
-            update_fields = []
+        # ====== FIX: ALLOW ALL FIELDS MENTOR MIGHT UPDATE ======
+        mentor_allowed_fields = {
+            'status', 
+            'mentor_comment',
+            'marks', 
+            'comment', 
+            'criteria_scores',
+            'criteria_total', 
+            'is_graded_by_criteria',
+            'reviewer',
+            'project'
+        }
+        
+        # ============================================================
+        # ====== IF MENTOR IS UPDATING, SKIP DUPLICATE CHECK ======
+        # ============================================================
+        if is_mentor and updated_fields.issubset(mentor_allowed_fields):
+            from projects.models import disable_duplicate_check, enable_duplicate_check
             
-            # Update status if provided
-            if 'status' in validated_data:
-                instance.status = validated_data['status']
-                update_fields.append('status')
+            # ====== DISABLE SIGNAL ======
+            disable_duplicate_check()
+            logger.info("DUPLICATE CHECK SIGNAL DISABLED for mentor update")
             
-            # Update mentor_comment if provided
-            if 'mentor_comment' in validated_data:
-                instance.mentor_comment = validated_data['mentor_comment']
-                update_fields.append('mentor_comment')
+            try:
+                # ====== SAVE PROJECT ======
+                updated_project = serializer.save()
+                logger.info(f"Project {updated_project.id} updated: {updated_project.title}")
+                
+                # ====== GET ORIGINAL PROJECT STATE ======
+                original_project = Project.objects.get(id=project.id)
+                original_flagged = original_project.is_flagged_duplicate
+                original_score = original_project.duplicate_check_score
+                
+                logger.info(f"Original state: flagged={original_flagged}, score={original_score}")
+                logger.info(f"Updated fields: {updated_fields}")
+                
+                # ====== FORCE RESET TO ORIGINAL FLAG STATE ======
+                if not original_flagged:
+                    # Was UNFLAGGED - keep UNFLAGGED
+                    Project.objects.filter(id=updated_project.id).update(
+                        is_flagged_duplicate=False,
+                        duplicate_check_score=None,
+                        duplicate_keywords_matched=[]
+                    )
+                    # ====== ONLY DELETE FLAGS IF PROJECT WAS UNFLAGGED ======
+                    DuplicateFlag.objects.filter(project=updated_project).delete()
+                    DuplicateFlag.objects.filter(similar_project=updated_project).delete()
+                    logger.info(f"FORCED project {updated_project.id} to remain UNFLAGGED")
+                else:
+                    # ====== Was FLAGGED - keep FLAGGED ======
+                    Project.objects.filter(id=updated_project.id).update(
+                        is_flagged_duplicate=True,
+                        duplicate_check_score=original_score
+                    )
+                    # ====== DO NOT DELETE FLAGS! ======
+                    logger.info(f"FORCED project {updated_project.id} to remain FLAGGED with score {original_score}")
+                
+                # Update instance
+                updated_project.is_flagged_duplicate = original_flagged
+                updated_project.duplicate_check_score = original_score
+                
+            finally:
+                # ====== ENABLE SIGNAL ======
+                enable_duplicate_check()
+                logger.info("DUPLICATE CHECK SIGNAL ENABLED")
             
-            # Save with update_fields to avoid signal issues
-            if update_fields:
-                instance.save(update_fields=update_fields)
             return
+
+        # ============================================================
+        # ====== NORMAL UPDATE (NOT MENTOR) ======
+        # ============================================================
         
-        # Coordinator and staff can update everything
-        if user.role in ['coordinator'] or user.is_staff:
-            serializer.save()
-            return
+        # Save project
+        updated_project = serializer.save()
+        logger.info(f"Project {updated_project.id} updated: {updated_project.title}")
+
+        # Regenerate embeddings if content changed
+        fields_to_check = ['title', 'main_objective', 'project_description', 'specific_objectives']
+        content_changed = False
         
-        raise PermissionDenied("You do not have permission to update this project.")
-    
-    # ============================================================
-    # ====== END UPDATE METHODS ======
-    # ============================================================
-    
-    @action(detail=True, methods=['post'])
-    def duplicate_check(self, request, pk=None):
+        for field in fields_to_check:
+            old_value = getattr(project, field)
+            new_value = getattr(updated_project, field)
+            if old_value != new_value:
+                content_changed = True
+                break
+        
+        if content_changed:
+            from projects.utils import generate_project_embeddings
+            embeddings = generate_project_embeddings(
+                title=updated_project.title,
+                objectives=updated_project.main_objective,
+                description=updated_project.project_description
+            )
+            
+            if embeddings:
+                updated_project.title_embedding = embeddings.get('title_embedding')
+                updated_project.objectives_embedding = embeddings.get('objectives_embedding')
+                updated_project.combined_embedding = embeddings.get('combined_embedding')
+                updated_project.last_similarity_check = timezone.now()
+                updated_project.save(update_fields=[
+                    'title_embedding', 'objectives_embedding', 
+                    'combined_embedding', 'last_similarity_check'
+                ])
+                logger.info(f"Regenerated embeddings for project {updated_project.id}")
+            else:
+                logger.warning(f"Failed to regenerate embeddings for project {updated_project.id}")
+
+        # Run duplicate check ONLY if content changed
+        if content_changed:
+            self._run_duplicate_check(updated_project)
+        else:
+            logger.info(f"No content changes - skipping duplicate check for project {updated_project.id}")
+
+        
+    def _run_duplicate_check(self, project):
         """
-        Manually trigger duplicate detection for a project.
-        Generates embeddings if they don't exist, then checks for similar projects.
+        Common function to run duplicate check for a project.
         """
         try:
-            project = self.get_object()
-            
-            # Generate embeddings if they don't exist
+            # ====== STEP 1: Generate embeddings if missing ======
             if project.combined_embedding is None:
                 from projects.utils import generate_project_embeddings
                 embeddings = generate_project_embeddings(
@@ -340,79 +401,224 @@ class ProjectViewSet(viewsets.ModelViewSet):
                     objectives=project.main_objective,
                     description=project.project_description
                 )
-                
                 if embeddings:
                     project.title_embedding = embeddings.get('title_embedding')
                     project.objectives_embedding = embeddings.get('objectives_embedding')
                     project.combined_embedding = embeddings.get('combined_embedding')
                     project.last_similarity_check = timezone.now()
-                    project.save()
-                    logger.info(f"✅ Generated embeddings for project {project.id} during duplicate check")
+                    project.save(update_fields=[
+                        'title_embedding', 'objectives_embedding', 
+                        'combined_embedding', 'last_similarity_check'
+                    ])
+                    logger.info(f"Generated embeddings for project {project.id}")
                 else:
-                    return Response({
-                        'error': 'Failed to generate embeddings for this project',
-                        'project_id': project.id
-                    }, status=status.HTTP_400_BAD_REQUEST)
+                    logger.warning(f"Failed to generate embeddings for project {project.id}")
+                    return
+
+            # ====== STEP 2: Get settings ======
+            settings = SystemSettings.get_solo()
+            auto_flag_threshold = settings.duplicate_auto_flag_threshold or 0.5
+
+            # ====== STEP 3: Find similar projects (EXCLUDE SAME USER) ======
+            try:
+                from pgvector.django import CosineDistance
+                
+                similar_projects = Project.objects.exclude(id=project.id).exclude(
+                    combined_embedding__isnull=True
+                ).exclude(
+                    user=project.user
+                ).annotate(
+                    distance=CosineDistance('combined_embedding', project.combined_embedding)
+                ).filter(
+                    distance__lt=1 - 0.3
+                ).order_by('distance')[:10]
+                
+            except Exception as e:
+                logger.error(f"pgvector error: {e}")
+                similar_projects = []
+
+            # ====== STEP 4: Check for duplicates ======
+            max_similarity = 0.0
+            best_match = None
+            matched_keywords = []
+
+            for match in similar_projects:
+                similarity = 1 - match.distance
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    best_match = match
+
+            # ====== STEP 5: Keyword matching ======
+            if best_match and max_similarity >= 0.3:
+                text1 = f"{project.title} {project.main_objective} {project.project_description or ''}"
+                text2 = f"{best_match.title} {best_match.main_objective} {best_match.project_description or ''}"
+                keywords1 = set(extract_keywords(text1))
+                keywords2 = set(extract_keywords(text2))
+                common = keywords1.intersection(keywords2)
+                matched_keywords = list(common)[:10]
+
+            # ============================================================
+            # ====== CHECK IF THIS IS THE FIRST PROJECT ======
+            # ============================================================
             
-            # Get similarity scorer
-            scorer = get_similarity_scorer()
+            older_projects = Project.objects.filter(
+                Q(user=project.user) | Q(project_users__user=project.user)
+            ).exclude(id=project.id).filter(created_at__lt=project.created_at).exists()
             
-            # Convert embeddings to lists using safe_to_list
-            title_emb = safe_to_list(project.title_embedding)
-            obj_emb = safe_to_list(project.objectives_embedding)
-            combined_emb = safe_to_list(project.combined_embedding)
+            should_flag = False
             
-            if combined_emb is None:
-                return Response({
-                    'error': 'No combined embedding available for this project',
-                    'project_id': project.id
-                }, status=status.HTTP_400_BAD_REQUEST)
+            if best_match and max_similarity >= auto_flag_threshold:
+                if older_projects:
+                    should_flag = True
+                    logger.info(f"Project {project.id} has older projects - FLAGGING")
+                else:
+                    logger.info(f"Project {project.id} is FIRST - NOT FLAGGING")
+
+            # ============================================================
+            # ====== CRITICAL FIX: ALWAYS CREATE DUPLICATEFLAG ======
+            # ============================================================
             
-            # Find similar projects
-            similar_projects = scorer.find_similar_projects(
-                project_id=project.id,
-                title=project.title,
-                objectives=f"{project.main_objective} {project.specific_objectives}",
-                title_embedding=title_emb,
-                objectives_embedding=obj_emb,
-                combined_embedding=combined_emb,
-                limit=10
-            )
-            
-            # Create duplicate flags for auto-flagged projects
-            auto_flagged = []
-            for similar in similar_projects:
-                if similar.get('auto_flag', False):
-                    flag, created = DuplicateFlag.objects.get_or_create(
-                        project=project,
-                        similar_project_id=similar['id'],
-                        defaults={
-                            'similarity_score': similar['hybrid_similarity'],
-                        }
+            if best_match and max_similarity >= auto_flag_threshold:
+                # ====== FLAG 1: Tree -> Forest ======
+                flag1, created1 = DuplicateFlag.objects.get_or_create(
+                    project=project,
+                    similar_project=best_match,
+                    defaults={
+                        'similarity_score': max_similarity,
+                    }
+                )
+                
+                if not created1:
+                    flag1.similarity_score = max_similarity
+                    flag1.save()
+                    logger.info(f"Updated flag: {project.id} -> {best_match.id}")
+                else:
+                    logger.info(f"Created flag: {project.id} -> {best_match.id}")
+                
+                # ====== FLAG 2: Forest -> Tree (BOTH SIDES) ======
+                flag2, created2 = DuplicateFlag.objects.get_or_create(
+                    project=best_match,
+                    similar_project=project,
+                    defaults={
+                        'similarity_score': max_similarity,
+                    }
+                )
+                
+                if not created2:
+                    flag2.similarity_score = max_similarity
+                    flag2.save()
+                    logger.info(f"Updated reverse flag: {best_match.id} -> {project.id}")
+                else:
+                    logger.info(f"Created reverse flag: {best_match.id} -> {project.id}")
+                
+                # ====== FLAG THE PROJECT IF IT'S SECOND+ ======
+                if should_flag:
+                    project.is_flagged_duplicate = True
+                    project.duplicate_check_score = max_similarity
+                    project.duplicate_keywords_matched = matched_keywords
+                    project.last_similarity_check = timezone.now()
+                    
+                    Project.objects.filter(id=project.id).update(
+                        is_flagged_duplicate=True,
+                        duplicate_check_score=max_similarity,
+                        duplicate_keywords_matched=matched_keywords,
+                        last_similarity_check=timezone.now()
                     )
-                    if created:
-                        auto_flagged.append(similar)
+                    
+                    if not best_match.is_flagged_duplicate:
+                        best_match.is_flagged_duplicate = True
+                        best_match.duplicate_check_score = max_similarity
+                        best_match.save(update_fields=['is_flagged_duplicate', 'duplicate_check_score'])
+                        logger.info(f"Also flagged other project {best_match.id} for mentor")
+                    
+                    logger.info(f"SECOND+ Project {project.id} FLAGGED! Score: {max_similarity:.3f}")
+                else:
+                    # ====== FIRST PROJECT - NEVER FLAGGED ======
+                    project.is_flagged_duplicate = False
+                    project.duplicate_check_score = None
+                    project.duplicate_keywords_matched = []
+                    project.last_similarity_check = timezone.now()
+                    
+                    Project.objects.filter(id=project.id).update(
+                        is_flagged_duplicate=False,
+                        duplicate_check_score=None,
+                        duplicate_keywords_matched=[],
+                        last_similarity_check=timezone.now()
+                    )
+                    
+                    logger.info(f"FIRST Project {project.id} - NOT FLAGGED (flag record exists)")
+            else:
+                # ====== NO DUPLICATE FOUND ======
+                project.is_flagged_duplicate = False
+                project.duplicate_check_score = None
+                project.duplicate_keywords_matched = []
+                project.last_similarity_check = timezone.now()
+                
+                Project.objects.filter(id=project.id).update(
+                    is_flagged_duplicate=False,
+                    duplicate_check_score=None,
+                    duplicate_keywords_matched=[],
+                    last_similarity_check=timezone.now()
+                )
+                
+                DuplicateFlag.objects.filter(project=project).delete()
+                DuplicateFlag.objects.filter(similar_project=project).delete()
+                
+                logger.info(f"Project {project.id} - no duplicates")
+
+            # ============================================================
+            # ====== VERIFY FLAG EXISTS ======
+            # ============================================================
             
-            # Update project status
-            if auto_flagged:
-                project.is_flagged_duplicate = True
-                project.save(update_fields=['is_flagged_duplicate'])
+            if should_flag:
+                flag_exists = DuplicateFlag.objects.filter(
+                    Q(project=project) | Q(similar_project=project)
+                ).exists()
+                
+                if not flag_exists:
+                    logger.error(f"Project {project.id} should be flagged but NO DuplicateFlag exists!")
+                    if best_match:
+                        DuplicateFlag.objects.create(
+                            project=project,
+                            similar_project=best_match,
+                            similarity_score=max_similarity
+                        )
+                        DuplicateFlag.objects.create(
+                            project=best_match,
+                            similar_project=project,
+                            similarity_score=max_similarity
+                        )
+                        logger.info(f"FORCE CREATED flags for {project.id} <-> {best_match.id}")
+
+        except Exception as e:
+            logger.error(f"Error in duplicate check for project {project.id}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # ============================================================
+    # ====== MANUAL DUPLICATE CHECK (BUTTON) ======
+    # ============================================================
+    @action(detail=True, methods=['post'])
+    def duplicate_check(self, request, pk=None):
+        """
+        Manually trigger duplicate detection for a project.
+        """
+        try:
+            project = self.get_object()
             
-            if similar_projects:
-                max_similarity = max(s['hybrid_similarity'] for s in similar_projects)
-                project.duplicate_check_score = max_similarity
-                project.save(update_fields=['duplicate_check_score'])
+            # Run duplicate check
+            self._run_duplicate_check(project)
             
-            project.last_similarity_check = timezone.now()
-            project.save(update_fields=['last_similarity_check'])
+            # Refresh project data
+            project.refresh_from_db()
             
             return Response({
                 'project_id': project.id,
                 'project_title': project.title,
-                'similar_projects': similar_projects,
-                'auto_flagged_count': len(auto_flagged),
-                'total_similar': len(similar_projects),
-                'is_flagged': project.is_flagged_duplicate
+                'is_flagged': project.is_flagged_duplicate,
+                'duplicate_check_score': project.duplicate_check_score,
+                'duplicate_keywords_matched': project.duplicate_keywords_matched,
+                'message': 'Duplicate check completed successfully'
             })
             
         except Exception as e:
@@ -433,71 +639,25 @@ class ProjectViewSet(viewsets.ModelViewSet):
         else:
             projects = Project.objects.filter(id__in=project_ids)
         
-        scorer = get_similarity_scorer()
         results = []
         total_auto_flagged = 0
         
         for project in projects:
             try:
-                # Generate embeddings if needed
-                if project.combined_embedding is None:
-                    from projects.utils import generate_project_embeddings
-                    embeddings = generate_project_embeddings(
-                        title=project.title,
-                        objectives=project.main_objective,
-                        description=project.project_description
-                    )
-                    if embeddings:
-                        project.title_embedding = embeddings.get('title_embedding')
-                        project.objectives_embedding = embeddings.get('objectives_embedding')
-                        project.combined_embedding = embeddings.get('combined_embedding')
-                        project.save()
-                
-                title_emb = safe_to_list(project.title_embedding)
-                obj_emb = safe_to_list(project.objectives_embedding)
-                combined_emb = safe_to_list(project.combined_embedding)
-
-                similar_projects = scorer.find_similar_projects(
-                    project_id=project.id,
-                    title=project.title,
-                    objectives=f"{project.main_objective} {project.specific_objectives}",
-                    title_embedding=title_emb,
-                    objectives_embedding=obj_emb,
-                    combined_embedding=combined_emb,
-                    limit=5
-                )
-                
-                auto_flagged = 0
-                for similar in similar_projects:
-                    if similar.get('auto_flag', False):
-                        flag, created = DuplicateFlag.objects.get_or_create(
-                            project=project,
-                            similar_project_id=similar['id'],
-                            defaults={
-                                'similarity_score': similar['hybrid_similarity'],
-                            }
-                        )
-                        if created:
-                            auto_flagged += 1
-                            total_auto_flagged += 1
-                            project.is_flagged_duplicate = True
-                            project.save(update_fields=['is_flagged_duplicate'])
-                
-                if similar_projects:
-                    max_similarity = max(s['hybrid_similarity'] for s in similar_projects)
-                    project.duplicate_check_score = max_similarity
-                    project.save(update_fields=['duplicate_check_score'])
-                
-                project.last_similarity_check = timezone.now()
-                project.save(update_fields=['last_similarity_check'])
+                # Run duplicate check for each project
+                self._run_duplicate_check(project)
+                project.refresh_from_db()
                 
                 results.append({
                     'project_id': project.id,
                     'project_title': project.title,
-                    'similar_projects_found': len(similar_projects),
-                    'auto_flagged': auto_flagged,
+                    'is_flagged': project.is_flagged_duplicate,
+                    'score': project.duplicate_check_score,
                     'processed': True
                 })
+                
+                if project.is_flagged_duplicate:
+                    total_auto_flagged += 1
                 
             except Exception as e:
                 logger.error(f"Failed to process project {project.id}: {e}")
@@ -541,17 +701,15 @@ class ProjectViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     # ============================================================
-    # GET SIMILAR PROJECTS WITH MENTOR COMMENTS
+    # ====== GET SIMILAR PROJECTS WITH MENTOR COMMENTS ======
     # ============================================================
     @action(detail=True, methods=['get'], url_path='similar')
     def similar_projects(self, request, pk=None):
         """
         Get projects similar to this project with mentor comments and similarity scores.
-        Only returns projects the user has permission to view.
         """
         try:
             current_project = self.get_object()
-            user = request.user
             
             # Get query parameters for filtering
             limit = int(request.query_params.get('limit', 10))
@@ -579,13 +737,6 @@ class ProjectViewSet(viewsets.ModelViewSet):
             
             similar_projects = Project.objects.filter(query)
             similar_projects = similar_projects.exclude(id=current_project.id)
-            
-            # If user is student, only show projects they can see
-            if user.role == 'student':
-                similar_projects = similar_projects.filter(
-                    models.Q(user=user) | 
-                    models.Q(project_users__user=user)
-                )
             
             if not include_proposed:
                 similar_projects = similar_projects.exclude(status='proposed')
@@ -630,33 +781,215 @@ class ProjectViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     # ============================================================
-    # Alternative: Similar projects with advanced search
+    # ====== GET ALL SIMILAR PROJECTS (BOTH SIDES + EMBEDDINGS) ======
+    # ============================================================
+    @action(detail=True, methods=['get'], url_path='similar-all')
+    def similar_all(self, request, pk=None):
+        """
+        Get ALL similar projects for a given project.
+        """
+        try:
+            project = self.get_object()
+            
+            # ====== STEP 1: Get flags ======
+            flags = DuplicateFlag.objects.filter(
+                Q(project=project) | Q(similar_project=project)
+            ).select_related('project', 'similar_project', 'project__user', 'similar_project__user')
+            
+            # ====== STEP 2: If no flags, find similar using embeddings ======
+            if not flags.exists():
+                logger.info(f"No flags found for project {project.id}, searching via embeddings...")
+                
+                try:
+                    from pgvector.django import CosineDistance
+                    
+                    # Find similar projects using embeddings
+                    similar_projects = Project.objects.exclude(id=project.id).exclude(
+                        combined_embedding__isnull=True
+                    ).exclude(
+                        user=project.user
+                    ).annotate(
+                        distance=CosineDistance('combined_embedding', project.combined_embedding)
+                    ).filter(
+                        distance__lt=1 - 0.3
+                    ).order_by('distance')[:5]
+                    
+                    if similar_projects.exists():
+                        logger.info(f"Found {similar_projects.count()} similar projects via embeddings")
+                        
+                        results = []
+                        for match in similar_projects:
+                            similarity = 1 - match.distance
+                            
+                            author_name = "Unknown"
+                            if match.user:
+                                name_parts = [
+                                    match.user.first_name or '',
+                                    match.user.middle_name or '',
+                                    match.user.last_name or ''
+                                ]
+                                author_name = ' '.join(filter(None, name_parts)).strip() or match.user.username or "Unknown"
+                            
+                            mentor_name = "N/A"
+                            if match.user and match.user.mentor:
+                                mentor = match.user.mentor
+                                name_parts = [
+                                    mentor.first_name or '',
+                                    mentor.middle_name or '',
+                                    mentor.last_name or ''
+                                ]
+                                mentor_name = ' '.join(filter(None, name_parts)).strip() or mentor.username or "N/A"
+                            
+                            project_type_name = "N/A"
+                            if match.project_type:
+                                project_type_name = match.project_type.name
+                            
+                            registration_numbers = []
+                            project_users = ProjectUser.objects.filter(project=match).select_related('user')
+                            for pu in project_users:
+                                if pu.user and pu.user.registration_number:
+                                    registration_numbers.append(pu.user.registration_number)
+                            
+                            results.append({
+                                'id': match.id,
+                                'title': match.title or 'Untitled',
+                                'description': match.project_description or '',
+                                'author_name': author_name,
+                                'mentor': mentor_name,
+                                'mentor_comment': match.mentor_comment,
+                                'similarity_score': similarity,
+                                'status': match.status or 'proposed',
+                                'year': match.year,
+                                'project_type_name': project_type_name,
+                                'flag_id': None,
+                                'reviewed': False,
+                                'flag_created_at': None,
+                                'registration_numbers': registration_numbers,
+                            })
+                        
+                        results.sort(key=lambda x: x['similarity_score'] or 0, reverse=True)
+                        
+                        return Response({
+                            'count': len(results),
+                            'results': results,
+                            'project_id': project.id,
+                            'project_title': project.title
+                        })
+                        
+                except Exception as e:
+                    logger.error(f"Error finding similar projects via embeddings: {e}")
+                
+                return Response({
+                    'count': 0,
+                    'results': [],
+                    'project_id': project.id,
+                    'message': 'No similar projects found'
+                })
+            
+            # ====== STEP 3: Process flags ======
+            seen_project_ids = set()
+            similar_projects_data = []
+            
+            for flag in flags:
+                if flag.project.id == project.id:
+                    other_project = flag.similar_project
+                else:
+                    other_project = flag.project
+                
+                if not other_project:
+                    continue
+                
+                if other_project.id in seen_project_ids:
+                    continue
+                seen_project_ids.add(other_project.id)
+                
+                author_name = "Unknown"
+                if other_project.user:
+                    name_parts = [
+                        other_project.user.first_name or '',
+                        other_project.user.middle_name or '',
+                        other_project.user.last_name or ''
+                    ]
+                    author_name = ' '.join(filter(None, name_parts)).strip() or other_project.user.username or "Unknown"
+                
+                mentor_name = "N/A"
+                if other_project.user and other_project.user.mentor:
+                    mentor = other_project.user.mentor
+                    name_parts = [
+                        mentor.first_name or '',
+                        mentor.middle_name or '',
+                        mentor.last_name or ''
+                    ]
+                    mentor_name = ' '.join(filter(None, name_parts)).strip() or mentor.username or "N/A"
+                
+                mentor_comment = other_project.mentor_comment if other_project.mentor_comment else None
+                
+                project_type_name = "N/A"
+                if other_project.project_type:
+                    project_type_name = other_project.project_type.name
+                
+                registration_numbers = []
+                project_users = ProjectUser.objects.filter(project=other_project).select_related('user')
+                for pu in project_users:
+                    if pu.user and pu.user.registration_number:
+                        registration_numbers.append(pu.user.registration_number)
+                
+                similar_projects_data.append({
+                    'id': other_project.id,
+                    'title': other_project.title or 'Untitled',
+                    'description': other_project.project_description or '',
+                    'author_name': author_name,
+                    'mentor': mentor_name,
+                    'mentor_comment': mentor_comment,
+                    'similarity_score': flag.similarity_score,
+                    'status': other_project.status or 'proposed',
+                    'year': other_project.year,
+                    'project_type_name': project_type_name,
+                    'flag_id': flag.id,
+                    'reviewed': flag.reviewed,
+                    'flag_created_at': flag.created_at,
+                    'registration_numbers': registration_numbers,
+                })
+            
+            similar_projects_data.sort(key=lambda x: x['similarity_score'] or 0, reverse=True)
+            
+            return Response({
+                'count': len(similar_projects_data),
+                'results': similar_projects_data,
+                'project_id': project.id,
+                'project_title': project.title
+            })
+            
+        except Project.DoesNotExist:
+            return Response({
+                'error': 'Project not found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error fetching all similar projects: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response({
+                'error': str(e),
+                'results': []
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    # ============================================================
+    # ====== ADVANCED SIMILAR PROJECTS ======
     # ============================================================
     @action(detail=True, methods=['get'], url_path='similar-advanced')
     def similar_projects_advanced(self, request, pk=None):
         """
         Advanced similarity matching using TF-IDF if available.
-        Falls back to basic search if scikit-learn is not installed.
         """
         try:
             current_project = self.get_object()
-            user = request.user
             
             try:
                 from sklearn.feature_extraction.text import TfidfVectorizer
                 from sklearn.metrics.pairwise import cosine_similarity
                 import numpy as np
                 
-                all_projects = Project.objects.exclude(id=current_project.id)
-                
-                # If user is student, only show projects they can see
-                if user.role == 'student':
-                    all_projects = all_projects.filter(
-                        models.Q(user=user) | 
-                        models.Q(project_users__user=user)
-                    )
-                
-                all_projects = all_projects.exclude(status='proposed')
+                all_projects = Project.objects.exclude(id=current_project.id).exclude(status='proposed')
                 
                 if not all_projects.exists():
                     return Response({
@@ -728,6 +1061,439 @@ class ProjectViewSet(viewsets.ModelViewSet):
             logger.error(f"Error in advanced similarity: {e}")
             return self.similar_projects(request, pk)
 
+    # ============================================================
+    # ====== AVAILABLE MENTORS ENDPOINT ======
+    # ============================================================
+    @action(detail=False, methods=['get'], url_path='available_mentors')
+    def available_mentors(self, request):
+        """
+        Get mentors available for assignment based on capacity and specialization.
+        """
+        project_type_id = request.query_params.get('project_type_id')
+        project_id = request.query_params.get('project_id')
+        
+        if project_id:
+            try:
+                project = Project.objects.get(id=project_id)
+                if project.project_type:
+                    project_type_id = project.project_type.id
+            except Project.DoesNotExist:
+                pass
+        
+        mentors = User.objects.filter(role='mentor')
+        
+        available_mentors = []
+        
+        for mentor in mentors:
+            current_students = User.objects.filter(mentor=mentor, role='student').count()
+            max_students = mentor.max_students or 5
+            available_slots = max_students - current_students
+            
+            if available_slots <= 0:
+                continue
+            
+            has_specialization = False
+            if project_type_id:
+                has_specialization = mentor.specialization and mentor.specialization.id == int(project_type_id)
+                if not has_specialization:
+                    if mentor.specialization:
+                        continue
+            else:
+                has_specialization = True
+            
+            available_mentors.append({
+                'id': mentor.id,
+                'name': f"{mentor.first_name} {mentor.last_name}",
+                'username': mentor.username,
+                'email': mentor.email,
+                'max_students': max_students,
+                'current_students': current_students,
+                'available_slots': available_slots,
+                'capacity_status': 'FULL' if available_slots <= 0 else f'{available_slots} slots left',
+                'specialization': mentor.specialization.name if mentor.specialization else None,
+                'has_specialization': has_specialization,
+                'mentor_bio': mentor.mentor_bio
+            })
+        
+        available_mentors.sort(key=lambda x: x['available_slots'], reverse=True)
+        
+        return Response({
+            'mentors': available_mentors,
+            'total': len(available_mentors),
+            'project_type_id': project_type_id
+        })
+
+    # ============================================================
+    # ====== BULK ACTION ENDPOINT (with CSRF exempt) ======
+    # ============================================================
+    @method_decorator(csrf_exempt, name='dispatch')
+    @action(detail=False, methods=['post'], url_path='bulk_action')
+    def bulk_action(self, request):
+        """
+        Perform bulk actions on multiple projects.
+        """
+        user = request.user
+        
+        # Check permissions
+        if user.role not in ['coordinator', 'admin'] and not user.is_staff:
+            raise PermissionDenied("Only coordinators and admins can perform bulk actions.")
+        
+        # Get data
+        action = request.data.get('action')
+        project_ids = request.data.get('project_ids', [])
+        data = request.data.get('data', {})
+        
+        # Validate
+        if not action:
+            return Response(
+                {'error': 'Action is required. Available actions: approve, reject, change_status, assign_mentor, auto_assign_mentor, export, delete'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not project_ids:
+            return Response(
+                {'error': 'No projects selected. Please provide project_ids.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get projects
+        projects = Project.objects.filter(id__in=project_ids)
+        
+        if not projects.exists():
+            return Response(
+                {'error': 'No valid projects found with the provided IDs.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Perform action
+        results = []
+        errors = []
+        processed_count = 0
+        
+        for project in projects:
+            try:
+                result = self._process_bulk_action(project, action, data, user)
+                results.append(result)
+                processed_count += 1
+            except Exception as e:
+                errors.append({
+                    'id': project.id,
+                    'title': project.title,
+                    'error': str(e)
+                })
+        
+        return Response({
+            'success': len(errors) == 0,
+            'processed': processed_count,
+            'failed': len(errors),
+            'total': len(projects),
+            'results': results,
+            'errors': errors,
+            'action': action
+        }, status=status.HTTP_200_OK)
+
+    def _process_bulk_action(self, project, action, data, user):
+        """Process a single bulk action for a project."""
+        result = {
+            'id': project.id,
+            'title': project.title,
+            'status': 'success'
+        }
+        
+        if action == 'approve':
+            project.status = 'approved'
+            project.save()
+            result['message'] = 'Project approved successfully.'
+            
+        elif action == 'reject':
+            project.status = 'rejected'
+            comment = data.get('comment', '')
+            if comment:
+                project.mentor_comment = comment
+            project.save()
+            result['message'] = 'Project rejected successfully.'
+            if comment:
+                result['comment'] = comment
+            
+        elif action == 'change_status':
+            new_status = data.get('status')
+            if not new_status:
+                raise ValueError('Status is required for change_status action.')
+            
+            valid_statuses = ['proposed', 'approved', 'rejected', 'completed']
+            if new_status not in valid_statuses:
+                raise ValueError(f'Invalid status. Must be one of: {", ".join(valid_statuses)}')
+            
+            project.status = new_status
+            project.save()
+            result['message'] = f'Status changed to {new_status}.'
+            result['new_status'] = new_status
+            
+        elif action == 'assign_mentor':
+            # ====== MANUAL ASSIGNMENT ======
+            mentor_id = data.get('mentor_id')
+            if not mentor_id:
+                raise ValueError('Mentor ID is required for assign_mentor action.')
+            
+            try:
+                mentor = User.objects.get(id=mentor_id, role='mentor')
+            except User.DoesNotExist:
+                raise ValueError(f'Mentor with ID {mentor_id} not found or is not a mentor.')
+            
+            # Check mentor capacity
+            current_students = User.objects.filter(mentor=mentor, role='student').count()
+            max_students = mentor.max_students or 5
+            available_slots = max_students - current_students
+            
+            if available_slots <= 0:
+                raise ValueError(f'Mentor {mentor.first_name} {mentor.last_name} is FULL. Current: {current_students}/{max_students}')
+            
+            # Get all students in this project
+            project_users = ProjectUser.objects.filter(project=project)
+            assigned_count = 0
+            students_assigned = []
+            
+            for pu in project_users:
+                if pu.user.role == 'student' and pu.user.mentor != mentor:
+                    if available_slots <= 0:
+                        result['warning'] = f'Stopped at {assigned_count} students. Mentor is full.'
+                        break
+                    pu.user.mentor = mentor
+                    pu.user.save()
+                    assigned_count += 1
+                    available_slots -= 1
+                    students_assigned.append({
+                        'id': pu.user.id,
+                        'name': pu.user.get_full_name(),
+                        'registration_number': pu.user.registration_number
+                    })
+            
+            # Also assign to the project owner if they are a student
+            if project.user and project.user.role == 'student' and project.user.mentor != mentor:
+                if available_slots > 0:
+                    project.user.mentor = mentor
+                    project.user.save()
+                    assigned_count += 1
+                    students_assigned.append({
+                        'id': project.user.id,
+                        'name': project.user.get_full_name(),
+                        'registration_number': project.user.registration_number
+                    })
+            
+            result['message'] = f'Assigned mentor {mentor.first_name} {mentor.last_name} to {assigned_count} students.'
+            result['assigned_count'] = assigned_count
+            result['mentor_id'] = mentor_id
+            result['mentor_name'] = f"{mentor.first_name} {mentor.last_name}"
+            result['students_assigned'] = students_assigned
+            result['mentor_capacity'] = {
+                'current': current_students + assigned_count,
+                'max': max_students,
+                'available': available_slots
+            }
+            
+        elif action == 'auto_assign_mentor':
+            # ====== AUTO ASSIGNMENT ======
+            result = self._auto_assign_mentor_to_project(project)
+            
+        elif action == 'export':
+            result['message'] = 'Project exported successfully.'
+            result['export_data'] = {
+                'id': project.id,
+                'title': project.title,
+                'status': project.status,
+                'project_type': project.project_type.name if project.project_type else None,
+                'main_objective': project.main_objective,
+                'year': project.year,
+                'created_at': project.created_at.isoformat(),
+                'student': project.user.username if project.user else None,
+            }
+            
+        elif action == 'delete':
+            project_title = project.title
+            project.delete()
+            result['message'] = f'Project "{project_title}" deleted successfully.'
+            
+        else:
+            raise ValueError(f'Unknown action: {action}')
+        
+        return result
+
+    def _auto_assign_mentor_to_project(self, project):
+        """
+        Auto-assign the best mentor to a project based on:
+        1. Specialization match
+        2. Available capacity
+        3. Current load balancing
+        """
+        result = {
+            'id': project.id,
+            'title': project.title,
+            'status': 'success'
+        }
+        
+        # Get project type
+        project_type = project.project_type
+        
+        # Get all mentors
+        mentors = User.objects.filter(role='mentor')
+        
+        if not mentors.exists():
+            raise ValueError('No mentors available in the system.')
+        
+        # Score each mentor
+        mentor_scores = []
+        
+        for mentor in mentors:
+            # Check capacity
+            current_students = User.objects.filter(mentor=mentor, role='student').count()
+            max_students = mentor.max_students or 5
+            available_slots = max_students - current_students
+            
+            if available_slots <= 0:
+                continue
+            
+            # Calculate score
+            score = 0
+            reasons = []
+            
+            # 1. Specialization match (40 points)
+            if project_type and mentor.specialization:
+                if mentor.specialization.id == project_type.id:
+                    score += 40
+                    reasons.append(f'Expert in {project_type.name}')
+                else:
+                    score += 10
+                    reasons.append(f'Specialized in {mentor.specialization.name}')
+            elif not mentor.specialization:
+                score += 20
+                reasons.append('General mentor (no specialization)')
+            else:
+                score += 5
+                reasons.append('No matching specialization')
+            
+            # 2. Available slots (30 points)
+            score += min(available_slots * 6, 30)
+            reasons.append(f'{available_slots} slots available')
+            
+            # 3. Current load balancing (20 points)
+            load_score = max(0, 20 - (current_students * 2))
+            score += load_score
+            reasons.append(f'{current_students} current students')
+            
+            # 4. Specialization exists (10 points)
+            if mentor.specialization:
+                score += 10
+                reasons.append('Has specialization defined')
+            
+            mentor_scores.append({
+                'mentor': mentor,
+                'score': score,
+                'available_slots': available_slots,
+                'current_students': current_students,
+                'max_students': max_students,
+                'reasons': reasons
+            })
+        
+        if not mentor_scores:
+            raise ValueError('No available mentors with capacity. All mentors are full.')
+        
+        # Sort by score (highest first)
+        mentor_scores.sort(key=lambda x: x['score'], reverse=True)
+        
+        # Get the best mentor
+        best = mentor_scores[0]
+        mentor = best['mentor']
+        available_slots = best['available_slots']
+        
+        # Get all students in this project
+        project_users = ProjectUser.objects.filter(project=project)
+        assigned_count = 0
+        students_assigned = []
+        
+        for pu in project_users:
+            if pu.user.role == 'student' and pu.user.mentor != mentor:
+                if available_slots <= 0:
+                    break
+                pu.user.mentor = mentor
+                pu.user.save()
+                assigned_count += 1
+                available_slots -= 1
+                students_assigned.append({
+                    'id': pu.user.id,
+                    'name': pu.user.get_full_name(),
+                    'registration_number': pu.user.registration_number
+                })
+        
+        # Also assign to the project owner if they are a student
+        if project.user and project.user.role == 'student' and project.user.mentor != mentor:
+            if available_slots > 0:
+                project.user.mentor = mentor
+                project.user.save()
+                assigned_count += 1
+                students_assigned.append({
+                    'id': project.user.id,
+                    'name': project.user.get_full_name(),
+                    'registration_number': project.user.registration_number
+                })
+        
+        result['message'] = f'Auto-assigned mentor {mentor.first_name} {mentor.last_name} to {assigned_count} students.'
+        result['assigned_count'] = assigned_count
+        result['mentor_id'] = mentor.id
+        result['mentor_name'] = f"{mentor.first_name} {mentor.last_name}"
+        result['students_assigned'] = students_assigned
+        result['assignment_score'] = best['score']
+        result['assignment_reasons'] = best['reasons']
+        result['mentor_capacity'] = {
+            'current': best['current_students'] + assigned_count,
+            'max': best['max_students'],
+            'available': available_slots
+        }
+        result['all_mentors_scored'] = [
+            {
+                'mentor_id': m['mentor'].id,
+                'mentor_name': f"{m['mentor'].first_name} {m['mentor'].last_name}",
+                'score': m['score'],
+                'available_slots': m['available_slots'],
+                'reasons': m['reasons']
+            }
+            for m in mentor_scores[:5]
+        ]
+        
+        return result
+
+
+# ============================================================
+# ====== HELPER FUNCTION FOR KEYWORD EXTRACTION ======
+# ============================================================
+
+def extract_keywords(text):
+    """
+    Extract keywords from text for duplicate detection.
+    """
+    stop_words = {
+        'the', 'a', 'an', 'of', 'for', 'on', 'at', 'to', 'in', 'with', 'by', 'from',
+        'up', 'off', 'out', 'over', 'under', 'about', 'after', 'before', 'between',
+        'among', 'through', 'during', 'without', 'against', 'within', 'upon', 'into',
+        'and', 'or', 'but', 'nor', 'for', 'so', 'yet', 'as', 'than', 'that', 'these',
+        'those', 'this', 'that', 'these', 'those', 'is', 'am', 'are', 'was', 'were',
+        'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+        'would', 'shall', 'should', 'may', 'might', 'must', 'can', 'could', 'use',
+        'using', 'system', 'application', 'web', 'mobile', 'project', 'development'
+    }
+    
+    if not text:
+        return []
+    
+    words = str(text).lower().split()
+    keywords = []
+    
+    for word in words:
+        word = ''.join(c for c in word if c.isalnum())
+        if len(word) > 3 and word not in stop_words:
+            keywords.append(word)
+    
+    return keywords
+
 
 # ============================================================
 # ====== PRESENTATION VIEWSET ======
@@ -770,13 +1536,37 @@ class PresentationResultViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        
+        logger.info(f"PresentationResultViewSet - User: {user.id} - {user.role}")
+        
         if not user.is_authenticated:
-            return self.queryset.none()
+            logger.warning("User not authenticated")
+            return PresentationResult.objects.none()
+        
+        student_id = self.request.query_params.get('student') or self.request.query_params.get('student_id')
+        logger.info(f"Student ID from query: {student_id}")
+        
+        queryset = PresentationResult.objects.all()
+        
+        if student_id:
+            try:
+                student_id = int(student_id)
+                queryset = queryset.filter(student_id=student_id)
+                logger.info(f"Filtered by student_id: {student_id} - {queryset.count()} results")
+                return queryset
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid student_id: {student_id}")
+        
         if user.role == 'student':
-            return self.queryset.filter(student=user)
-        if user.role == 'mentor':
-            return self.queryset.filter(student__mentor=user)
-        return self.queryset
+            queryset = queryset.filter(student=user)
+            logger.info(f"Student {user.id} - {queryset.count()} results")
+        elif user.role == 'mentor':
+            queryset = queryset.filter(student__mentor=user)
+            logger.info(f"Mentor {user.id} - {queryset.count()} results")
+        else:
+            logger.info(f"{user.role} {user.id} - {queryset.count()} results")
+        
+        return queryset
 
     def perform_create(self, serializer):
         user = self.request.user
@@ -785,6 +1575,7 @@ class PresentationResultViewSet(viewsets.ModelViewSet):
 
         student = serializer.validated_data.get('student')
         project = serializer.validated_data.get('project')
+        marks = serializer.validated_data.get('marks')
 
         if not student and project is not None:
             student = project.user
@@ -796,14 +1587,27 @@ class PresentationResultViewSet(viewsets.ModelViewSet):
         if user.role == 'mentor' and student.mentor_id != user.id:
             raise PermissionDenied("Mentors may only add results for their own students.")
 
-        serializer.save(reviewer=user)
+        result = serializer.save(reviewer=user)
+        
+        if marks is not None:
+            result.marks = marks
+            result.save(update_fields=['marks'])
+            logger.info(f"Presentation result created: {result.id} - Marks: {marks}")
+        else:
+            logger.info(f"Presentation result created: {result.id} - No marks provided")
 
     def perform_update(self, serializer):
         user = self.request.user
         result = self.get_object()
         if not user.is_staff and result.reviewer_id != user.id:
             raise PermissionDenied("Only the original reviewer or staff may update this result.")
-        serializer.save()
+        
+        updated_result = serializer.save()
+        marks = serializer.validated_data.get('marks')
+        if marks is not None:
+            updated_result.marks = marks
+            updated_result.save(update_fields=['marks'])
+            logger.info(f"Presentation result updated: {updated_result.id} - Marks: {marks}")
 
     def perform_destroy(self, instance):
         user = self.request.user
@@ -920,10 +1724,6 @@ class DuplicateFlagViewSet(viewsets.ModelViewSet):
     filterset_fields = ['reviewed', 'project', 'similar_project']
     
     def get_queryset(self):
-        """
-        Override to filter flags based on user permissions.
-        Students can only see flags for their own projects.
-        """
         queryset = super().get_queryset()
         user = self.request.user
         
@@ -931,18 +1731,14 @@ class DuplicateFlagViewSet(viewsets.ModelViewSet):
             return DuplicateFlag.objects.none()
         
         if user.role == 'student':
-            # Student can only see flags for their own projects
-            # Get all project IDs that belong to this student
             project_ids = Project.objects.filter(
-                models.Q(user=user) | models.Q(project_users__user=user)
+                django_models.Q(user=user) | django_models.Q(project_users__user=user)
             ).values_list('id', flat=True)
             
-            # Filter flags where project OR similar_project belongs to student
             queryset = queryset.filter(
                 Q(project_id__in=project_ids) | Q(similar_project_id__in=project_ids)
             )
         elif user.role == 'mentor':
-            # Mentor can see flags for their students' projects
             student_ids = User.objects.filter(mentor_id=user.id).values_list('id', flat=True)
             project_ids = Project.objects.filter(
                 Q(user_id__in=student_ids) | Q(project_users__user_id__in=student_ids)
@@ -950,7 +1746,6 @@ class DuplicateFlagViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(
                 Q(project_id__in=project_ids) | Q(similar_project_id__in=project_ids)
             )
-        # Coordinator and staff can see all flags
         
         return queryset
     
@@ -971,12 +1766,6 @@ class DuplicateFlagViewSet(viewsets.ModelViewSet):
 class PresentationCriteriaViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing presentation criteria.
-    
-    - list: Get all criteria (filter by presentation)
-    - retrieve: Get specific criteria
-    - create: Create new criteria
-    - update: Update criteria
-    - delete: Delete criteria
     """
     queryset = PresentationCriteria.objects.all()
     serializer_class = PresentationCriteriaSerializer
@@ -1012,12 +1801,6 @@ class PresentationCriteriaViewSet(viewsets.ModelViewSet):
 class PresentationResultCriteriaViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing presentation result criteria scores.
-    
-    - list: Get all criteria scores (filter by result)
-    - retrieve: Get specific criteria score
-    - create: Create new criteria score
-    - update: Update criteria score
-    - delete: Delete criteria score
     """
     queryset = PresentationResultCriteria.objects.all()
     serializer_class = PresentationResultCriteriaSerializer
@@ -1027,21 +1810,30 @@ class PresentationResultCriteriaViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         result_id = self.request.query_params.get('result')
+        criteria_id = self.request.query_params.get('criteria')
+        
         if result_id:
             queryset = queryset.filter(result_id=result_id)
+        if criteria_id:
+            queryset = queryset.filter(criteria_id=criteria_id)
+            
         return queryset
 
     def perform_create(self, serializer):
         user = self.request.user
         if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
             raise PermissionDenied("Only mentors, coordinators, or staff may add criteria scores.")
-        serializer.save()
+        
+        result = serializer.save()
+        logger.info(f"Created criteria score: result={result.result_id}, criteria={result.criteria_id}, score={result.score}")
 
     def perform_update(self, serializer):
         user = self.request.user
         if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
             raise PermissionDenied("Only mentors, coordinators, or staff may update criteria scores.")
-        serializer.save()
+        
+        result = serializer.save()
+        logger.info(f"Updated criteria score: result={result.result_id}, criteria={result.criteria_id}, score={result.score}")
 
     def perform_destroy(self, instance):
         user = self.request.user
@@ -1049,11 +1841,56 @@ class PresentationResultCriteriaViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Only mentors, coordinators, or staff may delete criteria scores.")
         instance.delete()
 
+    @action(detail=False, methods=['post'], url_path='save_score')
+    def save_score(self, request):
+        """
+        Save or update a criteria score.
+        """
+        user = request.user
+        if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
+            raise PermissionDenied("Only mentors, coordinators, or staff may save criteria scores.")
+        
+        result_id = request.data.get('result')
+        criteria_id = request.data.get('criteria')
+        score = request.data.get('score')
+        selected_option = request.data.get('selected_option', '')
+        comment = request.data.get('comment', '')
+        
+        if not result_id or not criteria_id:
+            return Response({
+                'error': 'result and criteria are required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        obj, created = PresentationResultCriteria.objects.get_or_create(
+            result_id=result_id,
+            criteria_id=criteria_id,
+            defaults={
+                'score': score,
+                'selected_option': selected_option,
+                'comment': comment
+            }
+        )
+        
+        if not created:
+            obj.score = score
+            obj.selected_option = selected_option
+            obj.comment = comment
+            obj.save()
+            logger.info(f"Updated criteria score: result={result_id}, criteria={criteria_id}, score={score}")
+        else:
+            logger.info(f"Created criteria score: result={result_id}, criteria={criteria_id}, score={score}")
+        
+        serializer = PresentationResultCriteriaSerializer(obj)
+        return Response({
+            'success': True,
+            'created': created,
+            'data': serializer.data
+        }, status=status.HTTP_200_OK)
+
 
 # ============================================================
-# END CRITERIA VIEWSETS
+# ====== AUTHENTICATION VIEWS ======
 # ============================================================
-
 
 @api_view(['POST'])
 @csrf_exempt
@@ -1100,7 +1937,6 @@ def logout_view(request):
 @authentication_classes([TokenAuthentication])
 @permission_classes([IsAuthenticated])
 def system_settings_view(request):
-    # Fixed: Use request.user instead of user
     if not request.user.is_staff and request.user.role != 'coordinator':
         raise PermissionDenied("Only coordinators or staff can manage system settings.")
 

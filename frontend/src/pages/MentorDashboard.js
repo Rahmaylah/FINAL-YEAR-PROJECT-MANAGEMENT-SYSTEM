@@ -108,8 +108,12 @@ function MentorDashboard() {
         const menteesData = menteesResponse.data.results || [];
         setMentees(menteesData);
 
+        // ====== FIX: Log mentees to see if Robby is there ======
+        console.log('📋 Mentees from API:', menteesData.map(m => ({ id: m.id, name: `${m.first_name} ${m.last_name}` })));
+
         const projectsResponse = await axios.get('/api/projects/');
         const projectsData = projectsResponse.data.results || [];
+        console.log('📁 All projects from API:', projectsData);
 
         const projectUsersResponse = await axios.get('/api/project-users/');
         const projectUsersData = projectUsersResponse.data.results || [];
@@ -124,12 +128,45 @@ function MentorDashboard() {
         setPresentations(presentationsData);
 
         const menteeIds = menteesData.map((student) => student.id);
+        console.log('📋 Mentee IDs:', menteeIds);
+
         const relatedProjectIds = projectUsersData
           .filter((relation) => menteeIds.includes(relation.user))
           .map((relation) => relation.project);
 
-        const filteredProjectIds = [...new Set(relatedProjectIds)];
-        const filteredProjects = projectsData.filter((project) => filteredProjectIds.includes(project.id));
+        const directProjectIds = projectsData
+          .filter((project) => {
+            if (!project.user) {
+              console.log(`⚠️ Project ${project.id} has no user:`, project);
+              return false;
+            }
+            
+            let userId = null;
+            
+            if (typeof project.user === 'number') {
+              userId = project.user;
+            } else if (typeof project.user === 'object' && project.user !== null) {
+              userId = project.user.id;
+            } else if (typeof project.user === 'string') {
+              userId = parseInt(project.user, 10);
+            }
+            
+            console.log(`🔍 Project ${project.id}: user = ${project.user}, userId = ${userId}`);
+            const isMentee = menteeIds.includes(userId);
+            console.log(`   Is in menteeIds? ${isMentee}`);
+            
+            return isMentee;
+          })
+          .map((project) => project.id);
+
+        console.log('📁 Direct project IDs (raw):', directProjectIds);
+        console.log('📁 Related project IDs:', relatedProjectIds);
+
+        const allProjectIds = [...new Set([...relatedProjectIds, ...directProjectIds])];
+        console.log('📁 All project IDs for mentor:', allProjectIds);
+
+        const filteredProjects = projectsData.filter((project) => allProjectIds.includes(project.id));
+        console.log('📁 Filtered projects:', filteredProjects);
 
         setProjects(filteredProjects);
       } catch (error) {
@@ -144,7 +181,6 @@ function MentorDashboard() {
 
   // ==================== PRESENTATION CRITERIA FUNCTIONS ====================
 
-  // Fetch criteria from database for selected presentation
   const fetchCriteria = async (presentationId) => {
     if (!presentationId) {
       setCriteriaList([]);
@@ -166,7 +202,6 @@ function MentorDashboard() {
     }
   };
 
-  // Handle presentation selection
   const handlePresentationSelect = async (presentationId) => {
     setSelectedPresentation(presentationId);
     setSelectedStudent('');
@@ -180,7 +215,6 @@ function MentorDashboard() {
     }
   };
 
-  // Handle student selection
   const handleStudentSelect = async (studentId) => {
     setSelectedStudent(studentId);
     setGradingScores({});
@@ -190,7 +224,6 @@ function MentorDashboard() {
     if (!studentId || !selectedPresentation) return;
 
     try {
-      // Check if student already has a result for this presentation
       const response = await axios.get('/api/presentation-results/?presentation=' + selectedPresentation + '&student=' + studentId);
       const results = response.data.results || response.data || [];
       
@@ -198,7 +231,6 @@ function MentorDashboard() {
         const result = results[0];
         setGradingResult(result);
         
-        // Fetch existing scores
         const scoresResponse = await axios.get('/api/presentation-result-criteria/?result=' + result.id);
         const existingScores = scoresResponse.data.results || scoresResponse.data || [];
         
@@ -211,15 +243,17 @@ function MentorDashboard() {
           };
         });
         setGradingScores(scoresMap);
+        
+        console.log('📋 Loaded existing scores for student:', scoresMap);
       } else {
         setGradingResult(null);
+        console.log('📋 No existing result for this student');
       }
     } catch (error) {
       console.error('Error fetching student result:', error);
     }
   };
 
-  // Handle score change for a criteria
   const handleScoreChange = (criteriaId, field, value) => {
     setGradingScores(prev => ({
       ...prev,
@@ -230,7 +264,7 @@ function MentorDashboard() {
     }));
   };
 
-  // ==================== SAVE GRADES WITH PROPER VALIDATION ====================
+  // ==================== FIXED: SAVE GRADES WITH DB VERIFICATION ====================
   const handleSaveGrades = async () => {
     // ====== VALIDATION ======
     if (!selectedPresentation) {
@@ -250,14 +284,39 @@ function MentorDashboard() {
 
     // ====== CHECK IF ALL REQUIRED CRITERIA ARE GRADED ======
     const missingCriteria = [];
+    let totalMarks = 0;
+    let hasScores = false;
+    
     for (const criteria of criteriaList) {
+      const scoreData = gradingScores[criteria.id] || {};
+      const hasScore = scoreData.score !== undefined && scoreData.score !== '' && scoreData.score !== null;
+      const hasOption = scoreData.selected_option && scoreData.selected_option !== '';
+      
       if (criteria.is_required) {
-        const scoreData = gradingScores[criteria.id] || {};
-        const hasScore = scoreData.score !== undefined && scoreData.score !== '' && scoreData.score !== null;
-        const hasOption = scoreData.selected_option && scoreData.selected_option !== '';
-        
         if (!hasScore && !hasOption) {
           missingCriteria.push(criteria.name);
+        } else {
+          hasScores = true;
+          if (hasScore) {
+            totalMarks += parseFloat(scoreData.score) || 0;
+          } else if (hasOption) {
+            const option = criteria.options?.find(o => o.label === scoreData.selected_option);
+            if (option) {
+              totalMarks += parseFloat(option.value) || 0;
+            }
+          }
+        }
+      } else {
+        if (hasScore || hasOption) {
+          hasScores = true;
+          if (hasScore) {
+            totalMarks += parseFloat(scoreData.score) || 0;
+          } else if (hasOption) {
+            const option = criteria.options?.find(o => o.label === scoreData.selected_option);
+            if (option) {
+              totalMarks += parseFloat(option.value) || 0;
+            }
+          }
         }
       }
     }
@@ -267,8 +326,19 @@ function MentorDashboard() {
       return;
     }
 
+    if (!hasScores) {
+      setGradingMessage('❌ Please enter at least one score.');
+      return;
+    }
+
     setGradingSaving(true);
     setGradingMessage('');
+
+    console.log('📊 ===== STARTING SAVE GRADES =====');
+    console.log('📊 Student ID:', selectedStudent);
+    console.log('📊 Presentation ID:', selectedPresentation);
+    console.log('📊 Total Marks:', totalMarks);
+    console.log('📊 Criteria Scores:', gradingScores);
 
     try {
       let resultId = gradingResult?.id;
@@ -279,63 +349,105 @@ function MentorDashboard() {
           p.project_users?.some(pu => pu.user === parseInt(selectedStudent))
         );
         
+        console.log('📊 Creating new presentation result...');
         const resultResponse = await axios.post('/api/presentation-results/', {
           presentation: parseInt(selectedPresentation),
           student: parseInt(selectedStudent),
           project: studentProject?.id || null,
           comment: '',
-          marks: null
+          marks: totalMarks
         });
         resultId = resultResponse.data.id;
         setGradingResult(resultResponse.data);
+        console.log('✅ Created result with ID:', resultId);
+      } else {
+        console.log('📊 Using existing result ID:', resultId);
       }
 
-      // Save each criteria score
-      const scores = Object.entries(gradingScores).map(([criteriaId, data]) => ({
-        criteria_id: parseInt(criteriaId),
-        score: data.score !== undefined && data.score !== '' && data.score !== null ? parseFloat(data.score) : null,
-        selected_option: data.selected_option || '',
-        comment: data.comment || ''
-      }));
-
-      // ====== SAVE EACH SCORE ======
-      for (const scoreData of scores) {
-        // Check if score already exists
-        const existingResponse = await axios.get('/api/presentation-result-criteria/?result=' + resultId + '&criteria=' + scoreData.criteria_id);
-        const existing = existingResponse.data.results || existingResponse.data || [];
+      // ====== Save EACH criteria score ======
+      let savedCount = 0;
+      for (const criteria of criteriaList) {
+        const scoreData = gradingScores[criteria.id] || {};
+        const hasScore = scoreData.score !== undefined && scoreData.score !== '' && scoreData.score !== null;
+        const hasOption = scoreData.selected_option && scoreData.selected_option !== '';
         
-        if (existing.length > 0) {
-          await axios.put('/api/presentation-result-criteria/' + existing[0].id + '/', {
+        if (!hasScore && !hasOption) {
+          console.log(`⏭️ Skipping criteria ${criteria.id} (${criteria.name}) - no score`);
+          continue;
+        }
+        
+        try {
+          const payload = {
             result: resultId,
-            criteria: scoreData.criteria_id,
-            score: scoreData.score,
-            selected_option: scoreData.selected_option,
-            comment: scoreData.comment
-          });
-        } else {
-          await axios.post('/api/presentation-result-criteria/', {
-            result: resultId,
-            criteria: scoreData.criteria_id,
-            score: scoreData.score,
-            selected_option: scoreData.selected_option,
-            comment: scoreData.comment
-          });
+            criteria: criteria.id,
+            score: hasScore ? parseFloat(scoreData.score) : null,
+            selected_option: hasOption ? scoreData.selected_option : '',
+            comment: scoreData.comment || ''
+          };
+          
+          console.log(`📊 Saving criteria ${criteria.id} (${criteria.name}):`, payload);
+          
+          try {
+            const response = await axios.post('/api/presentation-result-criteria/save_score/', payload);
+            savedCount++;
+            console.log(`✅ ${response.data.created ? 'Created' : 'Updated'} criteria ${criteria.id} (${criteria.name}) - DB ID: ${response.data.data.id}`);
+          } catch (saveError) {
+            console.log(`⚠️ save_score failed for criteria ${criteria.id}, using fallback...`);
+            
+            const existingResponse = await axios.get('/api/presentation-result-criteria/', {
+              params: {
+                result: resultId,
+                criteria: criteria.id
+              }
+            });
+            
+            const existing = existingResponse.data.results || existingResponse.data || [];
+            
+            if (existing.length > 0) {
+              const putResponse = await axios.put(`/api/presentation-result-criteria/${existing[0].id}/`, payload);
+              savedCount++;
+              console.log(`✅ Updated criteria ${criteria.id} (${criteria.name}) via PUT - DB ID: ${putResponse.data.id}`);
+            } else {
+              const postResponse = await axios.post('/api/presentation-result-criteria/', payload);
+              savedCount++;
+              console.log(`✅ Created criteria ${criteria.id} (${criteria.name}) via POST - DB ID: ${postResponse.data.id}`);
+            }
+          }
+        } catch (error) {
+          console.error(`❌ Error saving criteria ${criteria.id}:`, error);
         }
       }
 
+      console.log(`📊 Saved ${savedCount} out of ${criteriaList.length} criteria`);
+
       // ====== CALCULATE TOTAL ======
-      await axios.post('/api/presentation-results/' + resultId + '/calculate_total/');
+      console.log('📊 Calculating total...');
+      await axios.post(`/api/presentation-results/${resultId}/calculate_total/`);
+      
+      // ====== UPDATE MARKS ======
+      console.log('📊 Updating marks to:', totalMarks);
+      await axios.patch(`/api/presentation-results/${resultId}/`, {
+        marks: totalMarks
+      });
       
       // ====== REFRESH DATA ======
-      const refreshedResult = await axios.get('/api/presentation-results/' + resultId + '/');
+      console.log('📊 Refreshing result data...');
+      const refreshedResult = await axios.get(`/api/presentation-results/${resultId}/`);
       setGradingResult(refreshedResult.data);
       
-      setGradingMessage('✅ Grades saved successfully!');
+      console.log('📊 ===== SAVE COMPLETE =====');
+      console.log('📊 Final Result:', refreshedResult.data);
+      console.log('📊 Final Marks:', refreshedResult.data.marks);
+      console.log('📊 Criteria Total:', refreshedResult.data.criteria_total);
+      console.log('📊 Criteria Scores:', refreshedResult.data.criteria_scores);
+      
+      setGradingMessage(`✅ Grades saved successfully! Total: ${totalMarks} marks (${savedCount} criteria saved)`);
       setTimeout(() => {
         setGradingMessage('');
-      }, 3000);
+      }, 4000);
+      
     } catch (error) {
-      console.error('Error saving grades:', error);
+      console.error('❌ Error saving grades:', error);
       
       let errorMsg = '❌ Unable to save grades. Please try again.';
       if (error.response) {
@@ -345,7 +457,6 @@ function MentorDashboard() {
         } else if (error.response.data?.detail) {
           errorMsg = '❌ ' + error.response.data.detail;
         } else if (error.response.data && typeof error.response.data === 'object') {
-          // Handle field validation errors
           const errors = Object.values(error.response.data).flat();
           if (errors.length > 0) {
             errorMsg = '❌ ' + errors.join(', ');
@@ -452,9 +563,23 @@ function MentorDashboard() {
   const togglePresentations = () => setExpandedPresentations((prev) => !prev);
 
   const getProjectStudents = (projectId) => {
-    return projectUsers
+    const fromProjectUsers = projectUsers
       .filter((relation) => relation.project === projectId)
       .map((relation) => relation.user_name);
+    
+    if (fromProjectUsers.length > 0) {
+      return fromProjectUsers;
+    }
+    
+    const project = projects.find(p => p.id === projectId);
+    if (project && project.user) {
+      const student = mentees.find(m => m.id === project.user);
+      if (student) {
+        return [`${student.first_name} ${student.last_name}`];
+      }
+    }
+    
+    return ['No students assigned'];
   };
 
   const getProjectDuplicateFlags = (projectId) => (
@@ -473,7 +598,6 @@ function MentorDashboard() {
       try {
         const response = await axios.get('/api/projects/' + project.id + '/');
         setSelectedProject(response.data);
-        // Set current status and comment
         setSelectedStatus(response.data.status || 'proposed');
         setMentorComment(response.data.mentor_comment || '');
         setCommentMessage('');
@@ -487,7 +611,6 @@ function MentorDashboard() {
     };
     loadProjectDetails();
     setShowProjectDetailsModal(true);
-    // Fetch similar projects if flagged
     if (project.is_flagged_duplicate) {
       fetchSimilarProjects(project.id);
     } else {
@@ -497,33 +620,34 @@ function MentorDashboard() {
 
   const fetchSimilarProjects = async (projectId) => {
     setLoadingSimilar(true);
+    setSimilarProjects([]);
+    
     try {
-      const response = await axios.get('/api/duplicate-flags/?project=' + projectId);
+      const response = await axios.get(`/api/projects/${projectId}/similar-all/`);
       
-      let flags = [];
-      if (Array.isArray(response.data)) {
-        flags = response.data;
-      } else if (response.data.results) {
-        flags = response.data.results;
+      if (response.data.count === 0 || !response.data.results || response.data.results.length === 0) {
+        setSimilarProjects([]);
+        setLoadingSimilar(false);
+        return;
       }
       
-      const similarProjectsWithFlags = [];
-      for (const flag of flags) {
-        try {
-          const projectResponse = await axios.get('/api/projects/' + flag.similar_project + '/');
-          similarProjectsWithFlags.push({
-            ...projectResponse.data,
-            similarity_score: flag.similarity_score,
-            flag_id: flag.id,
-            reviewed: flag.reviewed,
-            reviewed_by: flag.reviewed_by,
-            reviewed_at: flag.reviewed_at
-          });
-        } catch (error) {
-          console.error('Error fetching project ' + flag.similar_project + ':', error);
-        }
-      }
-      setSimilarProjects(similarProjectsWithFlags);
+      const formattedProjects = response.data.results.map((item) => ({
+        id: item.id,
+        title: item.title || 'Untitled',
+        similarity_score: item.similarity_score || 0,
+        status: item.status || 'proposed',
+        year: item.year || 'N/A',
+        project_type_name: item.project_type_name || 'N/A',
+        reviewed: item.reviewed || false,
+        flag_id: item.flag_id,
+        author_name: item.author_name || 'Unknown',
+        mentor: item.mentor || 'N/A',
+        mentor_comment: item.mentor_comment || null,
+        description: item.description || '',
+        registration_numbers: item.registration_numbers || []
+      }));
+      
+      setSimilarProjects(formattedProjects);
     } catch (error) {
       console.error('Error fetching similar projects:', error);
       setSimilarProjects([]);
@@ -543,7 +667,6 @@ function MentorDashboard() {
     }
   };
 
-  // ==================== UPDATED: Handle Save Comment and Status with BUTTON ====================
   const handleSaveCommentAndStatus = async () => {
     if (!selectedProject || !selectedProject.id) {
       setProjectMessage('❌ No project selected.');
@@ -559,13 +682,11 @@ function MentorDashboard() {
       const updates = {};
       let hasChanges = false;
 
-      // Check if status changed
       if (selectedStatus !== selectedProject.status) {
         updates.status = selectedStatus;
         hasChanges = true;
       }
 
-      // Check if comment changed
       const currentComment = selectedProject.mentor_comment || '';
       if (mentorComment.trim() !== currentComment.trim()) {
         updates.mentor_comment = mentorComment.trim();
@@ -580,10 +701,8 @@ function MentorDashboard() {
         return;
       }
 
-      // Save all updates in one request
       const response = await axios.patch('/api/projects/' + selectedProject.id + '/', updates);
       
-      // Update local projects state
       setProjects((prevProjects) =>
         prevProjects.map((project) =>
           project.id === selectedProject.id ? { 
@@ -593,16 +712,13 @@ function MentorDashboard() {
         )
       );
       
-      // Update selected project
       setSelectedProject((prev) => ({ 
         ...prev, 
         ...response.data 
       }));
       
-      // Update current status
       setSelectedStatus(response.data.status);
       
-      // Show success messages
       if (updates.status) {
         setProjectMessage('✅ Status updated successfully!');
       } else {
@@ -613,7 +729,6 @@ function MentorDashboard() {
         setCommentMessage('✅ Comment saved successfully!');
       }
 
-      // Clear messages after delay
       setTimeout(() => {
         setCommentMessage('');
         setProjectMessage('');
@@ -1402,7 +1517,6 @@ function MentorDashboard() {
                   <button 
                     className="btn btn-outline-secondary" 
                     onClick={() => {
-                      // Reset to current values
                       setSelectedStatus(selectedProject.status || 'proposed');
                       setMentorComment(selectedProject.mentor_comment || '');
                       setCommentMessage('');

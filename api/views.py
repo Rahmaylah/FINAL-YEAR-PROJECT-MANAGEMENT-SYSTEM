@@ -243,16 +243,67 @@ class ProjectViewSet(viewsets.ModelViewSet):
     # ====== PERFORM_UPDATE - AUTO DUPLICATE CHECK ======
     # ============================================================
     def perform_update(self, serializer):
-        """Update project and automatically re-check for duplicates"""
+        """Update project - SKIP DUPLICATE CHECK FOR MENTOR"""
         # Get the existing project instance
         project = self.get_object()
+        
+        # ============================================================
+        # ====== CHECK IF MENTOR IS UPDATING ======
+        # ============================================================
+        user = self.request.user
+        is_mentor = user.role == 'mentor'
+        updated_fields = set(serializer.validated_data.keys())
+        mentor_allowed_fields = {'status', 'mentor_comment'}
+        
+        # ============================================================
+        # ====== IF MENTOR IS UPDATING, SKIP DUPLICATE CHECK ======
+        # ============================================================
+        if is_mentor and updated_fields.issubset(mentor_allowed_fields):
+            # ====== CRITICAL: Get original project state BEFORE saving ======
+            original_project = Project.objects.get(id=project.id)
+            original_flagged = original_project.is_flagged_duplicate
+            original_score = original_project.duplicate_check_score
+            
+            logger.info(f"🔍 Original project {original_project.id}: flagged={original_flagged}, score={original_score}")
+            
+            # ====== SAVE PROJECT ======
+            updated_project = serializer.save()
+            logger.info(f"🔄 Mentor update for project {updated_project.id}: {updated_fields}")
+            
+            # ====== FORCE RESET TO ORIGINAL FLAG STATE ======
+            if not original_flagged:
+                # Was UNFLAGGED - keep UNFLAGGED
+                Project.objects.filter(id=updated_project.id).update(
+                    is_flagged_duplicate=False,
+                    duplicate_check_score=None,
+                    duplicate_keywords_matched=[]
+                )
+                DuplicateFlag.objects.filter(project=updated_project).delete()
+                DuplicateFlag.objects.filter(similar_project=updated_project).delete()
+                logger.info(f"✅ FORCED project {updated_project.id} to remain UNFLAGGED")
+            else:
+                # Was FLAGGED - keep FLAGGED
+                Project.objects.filter(id=updated_project.id).update(
+                    is_flagged_duplicate=True,
+                    duplicate_check_score=original_score
+                )
+                logger.info(f"✅ FORCED project {updated_project.id} to remain FLAGGED with score {original_score}")
+            
+            # Update instance
+            updated_project.is_flagged_duplicate = original_flagged
+            updated_project.duplicate_check_score = original_score
+            
+            return
+
+        # ============================================================
+        # ====== NORMAL UPDATE (NOT MENTOR) ======
+        # ============================================================
         
         # ====== STEP 1: Save updated project ======
         updated_project = serializer.save()
         logger.info(f"🔄 Project {updated_project.id} updated: {updated_project.title}")
 
         # ====== STEP 2: Regenerate embeddings if content changed ======
-        # Check if important fields changed
         fields_to_check = ['title', 'main_objective', 'project_description', 'specific_objectives']
         content_changed = False
         
@@ -284,8 +335,55 @@ class ProjectViewSet(viewsets.ModelViewSet):
             else:
                 logger.warning(f"❌ Failed to regenerate embeddings for project {updated_project.id}")
 
-        # ====== STEP 3: Run duplicate check ======
-        self._run_duplicate_check(updated_project)
+        # ====== STEP 3: Run duplicate check ONLY if content changed ======
+        if content_changed:
+            self._run_duplicate_check(updated_project)
+        else:
+            logger.info(f"⏭️ No content changes - skipping duplicate check for project {updated_project.id}")
+    # def perform_update(self, serializer):
+    #     """Update project and automatically re-check for duplicates"""
+    #     # Get the existing project instance
+    #     project = self.get_object()
+        
+    #     # ====== STEP 1: Save updated project ======
+    #     updated_project = serializer.save()
+    #     logger.info(f"🔄 Project {updated_project.id} updated: {updated_project.title}")
+
+    #     # ====== STEP 2: Regenerate embeddings if content changed ======
+    #     # Check if important fields changed
+    #     fields_to_check = ['title', 'main_objective', 'project_description', 'specific_objectives']
+    #     content_changed = False
+        
+    #     for field in fields_to_check:
+    #         old_value = getattr(project, field)
+    #         new_value = getattr(updated_project, field)
+    #         if old_value != new_value:
+    #             content_changed = True
+    #             break
+        
+    #     if content_changed:
+    #         from projects.utils import generate_project_embeddings
+    #         embeddings = generate_project_embeddings(
+    #             title=updated_project.title,
+    #             objectives=updated_project.main_objective,
+    #             description=updated_project.project_description
+    #         )
+            
+    #         if embeddings:
+    #             updated_project.title_embedding = embeddings.get('title_embedding')
+    #             updated_project.objectives_embedding = embeddings.get('objectives_embedding')
+    #             updated_project.combined_embedding = embeddings.get('combined_embedding')
+    #             updated_project.last_similarity_check = timezone.now()
+    #             updated_project.save(update_fields=[
+    #                 'title_embedding', 'objectives_embedding', 
+    #                 'combined_embedding', 'last_similarity_check'
+    #             ])
+    #             logger.info(f"✅ Regenerated embeddings for project {updated_project.id}")
+    #         else:
+    #             logger.warning(f"❌ Failed to regenerate embeddings for project {updated_project.id}")
+
+    #     # ====== STEP 3: Run duplicate check ======
+    #     self._run_duplicate_check(updated_project)
 
     # ============================================================
     # ====== COMMON DUPLICATE CHECK FUNCTION ======
@@ -911,13 +1009,32 @@ class PresentationResultViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        
+        # ====== Check authentication ======
         if not user.is_authenticated:
             return self.queryset.none()
+        
+        # ====== Get student_id from query params ======
+        student_id = self.request.query_params.get('student')
+        
+        queryset = self.queryset.all()
+        
+        # ====== Filter by student_id if provided ======
+        if student_id:
+            try:
+                student_id = int(student_id)
+                queryset = queryset.filter(student_id=student_id)
+                return queryset
+            except (TypeError, ValueError):
+                pass
+        
+        # ====== Role-based filtering ======
         if user.role == 'student':
-            return self.queryset.filter(student=user)
-        if user.role == 'mentor':
-            return self.queryset.filter(student__mentor=user)
-        return self.queryset
+            queryset = queryset.filter(student=user)
+        elif user.role == 'mentor':
+            queryset = queryset.filter(student__mentor=user)
+        
+        return queryset
 
     def perform_create(self, serializer):
         user = self.request.user
@@ -1159,6 +1276,7 @@ class PresentationResultCriteriaViewSet(viewsets.ModelViewSet):
     - create: Create new criteria score
     - update: Update criteria score
     - delete: Delete criteria score
+    - save_score: Save or update a criteria score (create if not exists)
     """
     queryset = PresentationResultCriteria.objects.all()
     serializer_class = PresentationResultCriteriaSerializer
@@ -1168,27 +1286,88 @@ class PresentationResultCriteriaViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         queryset = super().get_queryset()
         result_id = self.request.query_params.get('result')
+        criteria_id = self.request.query_params.get('criteria')
+        
         if result_id:
             queryset = queryset.filter(result_id=result_id)
+        if criteria_id:
+            queryset = queryset.filter(criteria_id=criteria_id)
+            
         return queryset
 
     def perform_create(self, serializer):
         user = self.request.user
         if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
             raise PermissionDenied("Only mentors, coordinators, or staff may add criteria scores.")
-        serializer.save()
+        
+        result = serializer.save()
+        logger.info(f"✅ Created criteria score: result={result.result_id}, criteria={result.criteria_id}, score={result.score}")
 
     def perform_update(self, serializer):
         user = self.request.user
         if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
             raise PermissionDenied("Only mentors, coordinators, or staff may update criteria scores.")
-        serializer.save()
+        
+        result = serializer.save()
+        logger.info(f"✅ Updated criteria score: result={result.result_id}, criteria={result.criteria_id}, score={result.score}")
 
     def perform_destroy(self, instance):
         user = self.request.user
         if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
             raise PermissionDenied("Only mentors, coordinators, or staff may delete criteria scores.")
         instance.delete()
+
+    # ============================================================
+    # ====== FIX: CUSTOM ACTION TO SAVE OR CREATE SCORE ======
+    # ============================================================
+    @action(detail=False, methods=['post'], url_path='save_score')
+    def save_score(self, request):
+        """
+        Save or update a criteria score.
+        If it exists, update it. If not, create it.
+        """
+        user = request.user
+        if not user.is_authenticated or (not user.is_staff and user.role not in ['mentor', 'coordinator']):
+            raise PermissionDenied("Only mentors, coordinators, or staff may save criteria scores.")
+        
+        result_id = request.data.get('result')
+        criteria_id = request.data.get('criteria')
+        score = request.data.get('score')
+        selected_option = request.data.get('selected_option', '')
+        comment = request.data.get('comment', '')
+        
+        if not result_id or not criteria_id:
+            return Response({
+                'error': 'result and criteria are required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # ====== Try to get existing, or create new ======
+        obj, created = PresentationResultCriteria.objects.get_or_create(
+            result_id=result_id,
+            criteria_id=criteria_id,
+            defaults={
+                'score': score,
+                'selected_option': selected_option,
+                'comment': comment
+            }
+        )
+        
+        if not created:
+            # Update existing
+            obj.score = score
+            obj.selected_option = selected_option
+            obj.comment = comment
+            obj.save()
+            logger.info(f"✅ Updated criteria score: result={result_id}, criteria={criteria_id}, score={score}")
+        else:
+            logger.info(f"✅ Created criteria score: result={result_id}, criteria={criteria_id}, score={score}")
+        
+        serializer = PresentationResultCriteriaSerializer(obj)
+        return Response({
+            'success': True,
+            'created': created,
+            'data': serializer.data
+        }, status=status.HTTP_200_OK)
 
 
 # ============================================================

@@ -30,19 +30,17 @@ class SimilarityScorer:
     def __init__(self, embedding_service=None):
         self._embedding_service = embedding_service
 
-        # ====== FIXED: Lower thresholds for better duplicate detection ======
-        # Load configuration from settings, but avoid failing when Django settings are not initialized.
+        # ====== FIXED: Higher thresholds for better accuracy ======
         if getattr(settings, 'configured', False):
             self.semantic_weight = getattr(settings, 'DUPLICATE_SEMANTIC_WEIGHT', 0.7)
             self.lexical_weight = getattr(settings, 'DUPLICATE_LEXICAL_WEIGHT', 0.3)
-            self.similarity_threshold = getattr(settings, 'DUPLICATE_SIMILARITY_THRESHOLD', 0.4)  # ← 40%
-            self.auto_flag_threshold = getattr(settings, 'DUPLICATE_AUTO_FLAG_THRESHOLD', 0.5)    # ← 50%
+            self.similarity_threshold = getattr(settings, 'DUPLICATE_SIMILARITY_THRESHOLD', 0.4)
+            self.auto_flag_threshold = getattr(settings, 'DUPLICATE_AUTO_FLAG_THRESHOLD', 0.5)
         else:
             self.semantic_weight = 0.7
             self.lexical_weight = 0.3
-            self.similarity_threshold = 0.4   # ← 40%
-            self.auto_flag_threshold = 0.5    # ← 50%
-        # ====== END OF FIX ======
+            self.similarity_threshold = 0.4
+            self.auto_flag_threshold = 0.5
         
         self.search_years_back = getattr(settings, 'DUPLICATE_SEARCH_YEARS_BACK', 3) if getattr(settings, 'configured', False) else 3
         self.algorithm = getattr(settings, 'DUPLICATE_ALGORITHM', 'HYBRID') if getattr(settings, 'configured', False) else 'HYBRID'
@@ -186,7 +184,6 @@ class SimilarityScorer:
                 if not has_trgm:
                     logger.warning("pg_trgm extension not available, using fallback")
                     return self._fallback_lexical_similarity(text1, text2)
-                # ====== END OF FIX ======
                 
                 cursor.execute("""
                     SELECT similarity(%s, %s)
@@ -195,7 +192,6 @@ class SimilarityScorer:
                 return float(result[0]) if result else 0.0
         except Exception as e:
             logger.warning(f"Failed to calculate lexical similarity: {e}")
-            # Fallback to simple Jaccard similarity if pg_trgm is not available
             return self._fallback_lexical_similarity(text1, text2)
 
     def _fallback_lexical_similarity(self, text1: str, text2: str) -> float:
@@ -209,7 +205,6 @@ class SimilarityScorer:
         Returns:
             Lexical similarity score (0.0 to 1.0)
         """
-        # Simple word-based Jaccard similarity
         words1 = set(text1.lower().split())
         words2 = set(text2.lower().split())
 
@@ -253,7 +248,6 @@ class SimilarityScorer:
                 logger.warning(f"Failed to calculate semantic similarity: {e}")
                 semantic_score = 0.0
         else:
-            # Fallback: use lexical similarity for both components
             lexical_fallback = self.calculate_lexical_similarity(text1, text2)
             semantic_score = lexical_fallback
             logger.debug("Using lexical similarity as fallback for semantic score")
@@ -280,21 +274,12 @@ class SimilarityScorer:
                             title_embedding: Optional[List[float]] = None,
                             objectives_embedding: Optional[List[float]] = None,
                             combined_embedding: Optional[List[float]] = None,
-                            limit: int = 10) -> List[Dict[str, Any]]:
+                            limit: int = 10,
+                            exclude_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Find projects similar to the given project using vector similarity search.
 
-        Args:
-            project_id: ID of the project to exclude from results
-            title: Project title
-            objectives: Project objectives
-            title_embedding: Pre-computed title embedding
-            objectives_embedding: Pre-computed objectives embedding
-            combined_embedding: Pre-computed combined embedding
-            limit: Maximum number of similar projects to return
-
-        Returns:
-            List of similar projects with similarity scores
+        ====== FIXED: Exclude same user's projects ======
         """
         try:
             min_year = timezone.now().year - max(self.search_years_back - 1, 0)
@@ -302,17 +287,22 @@ class SimilarityScorer:
             # Normalize combined_embedding
             combined_emb = self._normalize_embedding(combined_embedding)
             
+            # ====== Build query with user exclusion if needed ======
+            user_exclusion_clause = ""
+            if exclude_user_id:
+                user_exclusion_clause = f" AND p.user_id != {exclude_user_id}"
+            
             if combined_emb is not None and len(combined_emb) > 0:
                 # Convert to pgvector string format
                 embedding_str = self._to_pgvector_string(combined_emb)
                 
                 if embedding_str is None:
                     logger.warning("Failed to convert embedding to pgvector string")
-                    return self._find_similar_projects_lexical(project_id, title, objectives, limit)
+                    return self._find_similar_projects_lexical(project_id, title, objectives, limit, exclude_user_id)
                 
                 with connection.cursor() as cursor:
-                    # Vector similarity search using pgvector - REMOVED array_length
-                    cursor.execute("""
+                    # Vector similarity search using pgvector
+                    cursor.execute(f"""
                         SELECT
                             p.id,
                             p.title,
@@ -328,6 +318,7 @@ class SimilarityScorer:
                         WHERE p.id != %s 
                             AND p.combined_embedding IS NOT NULL 
                             AND p.year >= %s
+                            {user_exclusion_clause}
                         ORDER BY 
                             CASE 
                                 WHEN p.combined_embedding IS NOT NULL 
@@ -362,9 +353,8 @@ class SimilarityScorer:
                             logger.warning(f"Failed to calculate hybrid similarity: {e}")
                             hybrid_sim = float(vec_sim) if vec_sim is not None else 0.0
 
-                        # ====== FIXED: Auto-flag if similarity >= threshold ======
+                        # ====== Auto-flag if similarity >= threshold ======
                         is_auto_flagged = hybrid_sim >= self.auto_flag_threshold
-                        # ====== END OF FIX ======
 
                         similar_projects.append({
                             'id': proj_id,
@@ -373,7 +363,7 @@ class SimilarityScorer:
                             'vector_similarity': float(vec_sim) if vec_sim is not None else None,
                             'hybrid_similarity': hybrid_sim,
                             'is_potential_duplicate': hybrid_sim >= self.similarity_threshold,
-                            'auto_flag': is_auto_flagged  # ← Now uses the fixed threshold
+                            'auto_flag': is_auto_flagged
                         })
 
                     # Sort by hybrid similarity descending
@@ -382,40 +372,35 @@ class SimilarityScorer:
             else:
                 # Fallback: lexical similarity only
                 logger.warning("No embeddings available, using lexical similarity fallback")
-                return self._find_similar_projects_lexical(project_id, title, objectives, limit)
+                return self._find_similar_projects_lexical(project_id, title, objectives, limit, exclude_user_id)
 
         except Exception as e:
             logger.error(f"Failed to find similar projects: {e}")
             import traceback
             traceback.print_exc()
-            # Fallback to lexical search
-            return self._find_similar_projects_lexical(project_id, title, objectives, limit)
+            return self._find_similar_projects_lexical(project_id, title, objectives, limit, exclude_user_id)
 
     def _find_similar_projects_lexical(self,
                                      project_id: int,
                                      title: str,
                                      objectives: str,
-                                     limit: int = 10) -> List[Dict[str, Any]]:
+                                     limit: int = 10,
+                                     exclude_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Fallback method using lexical similarity when vector search is unavailable.
 
-        Args:
-            project_id: ID of the project to exclude
-            title: Project title
-            objectives: Project objectives
-            limit: Maximum results to return
-
-        Returns:
-            List of similar projects with lexical similarity scores
+        ====== FIXED: Exclude same user's projects ======
         """
         try:
             combined_text = f"{title} {objectives}"
             min_year = timezone.now().year - max(self.search_years_back - 1, 0)
 
-            # First try with pg_trgm
+            user_exclusion_clause = ""
+            if exclude_user_id:
+                user_exclusion_clause = f" AND p.user_id != {exclude_user_id}"
+
             try:
                 with connection.cursor() as cursor:
-                    # ====== FIXED: Check if pg_trgm exists first ======
                     cursor.execute("""
                         SELECT EXISTS (
                             SELECT 1 FROM pg_extension WHERE extname = 'pg_trgm'
@@ -425,10 +410,9 @@ class SimilarityScorer:
                     
                     if not has_trgm:
                         logger.warning("pg_trgm not available, using fallback lexical")
-                        return self._fallback_lexical_search(project_id, combined_text, min_year, limit)
-                    # ====== END OF FIX ======
+                        return self._fallback_lexical_search(project_id, combined_text, min_year, limit, exclude_user_id)
                     
-                    cursor.execute("""
+                    cursor.execute(f"""
                         SELECT
                             p.id,
                             p.title,
@@ -437,6 +421,7 @@ class SimilarityScorer:
                             similarity(%s, p.title || ' ' || COALESCE(p.main_objective, '') || ' ' || COALESCE(p.project_description, '')) as lexical_similarity
                         FROM projects_project p
                         WHERE p.id != %s AND p.year >= %s
+                            {user_exclusion_clause}
                         ORDER BY similarity(%s, p.title || ' ' || COALESCE(p.main_objective, '') || ' ' || COALESCE(p.project_description, '')) DESC
                         LIMIT %s
                     """, [combined_text, project_id, min_year, combined_text, limit])
@@ -445,7 +430,6 @@ class SimilarityScorer:
                     for row in cursor.fetchall():
                         proj_id, proj_title, proj_main_obj, proj_spec_obj, lex_sim = row
 
-                        # Convert JSON specific_objectives to string
                         proj_objectives = proj_main_obj or ""
                         if proj_spec_obj:
                             if isinstance(proj_spec_obj, list):
@@ -453,7 +437,6 @@ class SimilarityScorer:
                             else:
                                 proj_objectives += " " + str(proj_spec_obj)
 
-                        # For lexical-only search, use lexical score as hybrid score
                         hybrid_sim = float(lex_sim) if lex_sim is not None else 0.0
 
                         similar_projects.append({
@@ -469,30 +452,38 @@ class SimilarityScorer:
                     return similar_projects
             except Exception as e:
                 logger.warning(f"pg_trgm not available, using fallback lexical: {e}")
-                return self._fallback_lexical_search(project_id, combined_text, min_year, limit)
+                return self._fallback_lexical_search(project_id, combined_text, min_year, limit, exclude_user_id)
 
         except Exception as e:
             logger.error(f"Failed to find similar projects with lexical search: {e}")
             return []
 
-    def _fallback_lexical_search(self, project_id: int, text: str, min_year: int, limit: int) -> List[Dict[str, Any]]:
+    def _fallback_lexical_search(self, 
+                                 project_id: int, 
+                                 text: str, 
+                                 min_year: int, 
+                                 limit: int,
+                                 exclude_user_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         Simple fallback lexical search using ILIKE when pg_trgm is not available.
+
+        ====== FIXED: Exclude same user's projects ======
         """
         try:
             from projects.models import Project
             from django.db import models as django_models
             
-            # Split text into words and search for them
             words = text.lower().split()
             if not words:
                 return []
 
-            # Build a simple search query using ILIKE
             query = Project.objects.exclude(id=project_id).filter(year__gte=min_year)
             
-            # Search for each word in title or objective
-            for word in words[:10]:  # Limit to 10 words
+            # ====== FIX: Exclude same user ======
+            if exclude_user_id:
+                query = query.exclude(user_id=exclude_user_id)
+            
+            for word in words[:10]:
                 if len(word) > 3:
                     query = query.filter(
                         django_models.Q(title__icontains=word) | 
@@ -503,7 +494,6 @@ class SimilarityScorer:
             similar_projects = query[:limit]
             results = []
             for p in similar_projects:
-                # Calculate rough similarity based on word overlap
                 p_text = f"{p.title} {p.main_objective} {p.project_description or ''}".lower()
                 p_words = set(p_text.split())
                 query_words = set(text.lower().split())

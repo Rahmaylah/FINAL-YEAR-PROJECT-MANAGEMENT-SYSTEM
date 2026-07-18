@@ -46,7 +46,10 @@ function CoordinatorDashboard() {
     last_name: '',
     email: '',
     registration_number: '',
-    mentor: null
+    mentor: null,
+    max_students: 5,
+    specialization: null,
+    mentor_bio: ''
   });
   const [userPassword, setUserPassword] = useState({
     current_password: '',
@@ -62,6 +65,7 @@ function CoordinatorDashboard() {
   const [mentorProjects, setMentorProjects] = useState([]);
   const [projectUsers, setProjectUsers] = useState([]);
   const [projects, setProjects] = useState([]);
+  const [projectTypes, setProjectTypes] = useState([]);
   const [duplicates, setDuplicates] = useState([]);
   const [stats, setStats] = useState({});
   const [loading, setLoading] = useState(true);
@@ -131,6 +135,23 @@ function CoordinatorDashboard() {
   const [presentationStudents, setPresentationStudents] = useState([]);
   // ==================== END PRESENTATION CRITERIA STATES ====================
 
+  // ==================== BULK OPERATIONS STATES ====================
+  const [selectedProjects, setSelectedProjects] = useState([]);
+  const [selectAll, setSelectAll] = useState(false);
+  const [bulkAction, setBulkAction] = useState('');
+  const [showBulkModal, setShowBulkModal] = useState(false);
+  const [bulkData, setBulkData] = useState({
+    status: '',
+    mentor_id: '',
+    comment: '',
+    message: ''
+  });
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [bulkResult, setBulkResult] = useState(null);
+  const [availableMentors, setAvailableMentors] = useState([]);
+  const [loadingMentors, setLoadingMentors] = useState(false);
+  // ==================== END BULK OPERATIONS STATES ====================
+
   // Image error fallback
   const [imageError, setImageError] = useState(false);
 
@@ -155,37 +176,33 @@ function CoordinatorDashboard() {
     const fetchData = async () => {
       setLoading(true);
       try {
-        // Fetch all users
         const usersResponse = await axios.get('/api/users/');
         const usersData = usersResponse.data.results || [];
         setUsers(usersData);
 
-        // Fetch all projects
         const projectsResponse = await axios.get('/api/projects/');
         const projectsData = projectsResponse.data.results || [];
         setProjects(projectsData);
 
-        // Fetch duplicate flags
+        const projectTypesResponse = await axios.get('/api/project-types/');
+        setProjectTypes(projectTypesResponse.data.results || []);
+
         const duplicatesResponse = await axios.get('/api/duplicate-flags/');
         const duplicatesData = duplicatesResponse.data.results || [];
         setDuplicates(duplicatesData);
 
-        // Fetch project users
         const projectUsersResponse = await axios.get('/api/project-users/');
         const projectUsersData = projectUsersResponse.data.results || [];
         setProjectUsers(projectUsersData);
 
-        // Fetch presentations
         const presentationsResponse = await axios.get('/api/presentations/');
         const presentationsData = presentationsResponse.data.results || [];
         setPresentations(presentationsData);
 
-        // Fetch criteria for all presentations
         const criteriaResponse = await axios.get('/api/presentation-criteria/');
         const criteriaData = criteriaResponse.data.results || criteriaResponse.data || [];
         setCriteriaList(criteriaData);
 
-        // Calculate mentees and mentor projects based on current coordinator
         const userMentees = usersData.filter(u => u.role === 'student' && (u.mentor === user.id || (u.mentor_info && u.mentor_info.id === user.id)));
         setMentees(userMentees);
 
@@ -207,7 +224,6 @@ function CoordinatorDashboard() {
           duplicate_lexical_weight: settingsResponse.data.duplicate_lexical_weight
         });
 
-        // Calculate stats
         const totalUsers = usersResponse.data.count || usersData.length;
         const totalProjects = projectsResponse.data.count || projectsData.length;
         const approvedProjects = projectsData.filter(p => p.status === 'approved').length;
@@ -234,9 +250,83 @@ function CoordinatorDashboard() {
     fetchData();
   }, []);
 
+  // ==================== HELPER FUNCTIONS ====================
+  
+  const getProjectStudentsWithMentors = (projectId) => {
+    const projectUserRelations = projectUsers.filter(
+      (relation) => relation.project === projectId
+    );
+    
+    const studentDetails = projectUserRelations.map((relation) => {
+      const student = users.find(u => u.id === relation.user);
+      if (!student) return null;
+      
+      let mentorInfo = null;
+      if (student.mentor) {
+        mentorInfo = users.find(u => u.id === student.mentor);
+      }
+      
+      return {
+        id: student.id,
+        name: `${student.first_name || ''} ${student.middle_name || ''} ${student.last_name || ''}`.trim() || student.username,
+        username: student.username,
+        registration_number: student.registration_number || 'N/A',
+        email: student.email,
+        mentor: mentorInfo ? {
+          id: mentorInfo.id,
+          name: `${mentorInfo.first_name || ''} ${mentorInfo.middle_name || ''} ${mentorInfo.last_name || ''}`.trim() || mentorInfo.username,
+          username: mentorInfo.username
+        } : null,
+        role: relation.role || 'member'
+      };
+    }).filter(s => s !== null);
+    
+    const project = projects.find(p => p.id === projectId);
+    if (project && project.user) {
+      const owner = users.find(u => u.id === project.user);
+      if (owner && !studentDetails.find(s => s.id === owner.id)) {
+        let mentorInfo = null;
+        if (owner.mentor) {
+          mentorInfo = users.find(u => u.id === owner.mentor);
+        }
+        
+        studentDetails.push({
+          id: owner.id,
+          name: `${owner.first_name || ''} ${owner.middle_name || ''} ${owner.last_name || ''}`.trim() || owner.username,
+          username: owner.username,
+          registration_number: owner.registration_number || 'N/A',
+          email: owner.email,
+          mentor: mentorInfo ? {
+            id: mentorInfo.id,
+            name: `${mentorInfo.first_name || ''} ${mentorInfo.middle_name || ''} ${mentorInfo.last_name || ''}`.trim() || mentorInfo.username,
+            username: mentorInfo.username
+          } : null,
+          role: 'owner'
+        });
+      }
+    }
+    
+    return studentDetails;
+  };
+
+  const getMentorCapacityStatus = (mentor) => {
+    const currentStudents = users.filter(u => u.mentor === mentor.id && u.role === 'student').length;
+    const maxStudents = mentor.max_students || 5;
+    const available = maxStudents - currentStudents;
+    
+    return {
+      current: currentStudents,
+      max: maxStudents,
+      available: available,
+      isFull: available <= 0,
+      status: available <= 0 ? 'FULL' : `${available} slots available`
+    };
+  };
+
+  // ==================== END HELPER FUNCTIONS ====================
+
   // ==================== PRESENTATION CRITERIA FUNCTIONS ====================
 
-  // Fetch criteria for a specific presentation
   const fetchCriteria = async (presentationId) => {
     try {
       const response = await axios.get('/api/presentation-criteria/?presentation=' + presentationId);
@@ -253,7 +343,6 @@ function CoordinatorDashboard() {
     }
   };
 
-  // Fetch students for a presentation
   const fetchPresentationStudents = async (presentationId) => {
     try {
       const response = await axios.get('/api/presentation-results/?presentation=' + presentationId);
@@ -289,7 +378,6 @@ function CoordinatorDashboard() {
     }
   };
 
-  // Open presentation modal
   const openPresentationModal = (presentation = null) => {
     setSelectedPresentation(presentation);
     if (presentation) {
@@ -313,7 +401,6 @@ function CoordinatorDashboard() {
     setPresentationMessage('');
   };
 
-  // Save presentation
   const handleSavePresentation = async () => {
     setPresentationSaving(true);
     setPresentationMessage('');
@@ -328,39 +415,36 @@ function CoordinatorDashboard() {
       if (selectedPresentation) {
         response = await axios.put('/api/presentations/' + selectedPresentation.id + '/', data);
         setPresentations(prev => prev.map(p => p.id === selectedPresentation.id ? response.data : p));
-        setPresentationMessage('✅ Presentation updated successfully.');
+        setPresentationMessage('Presentation updated successfully.');
       } else {
         response = await axios.post('/api/presentations/', data);
         setPresentations(prev => [...prev, response.data]);
-        setPresentationMessage('✅ Presentation created successfully.');
+        setPresentationMessage('Presentation created successfully.');
       }
       setShowPresentationModal(false);
       const presentationsResponse = await axios.get('/api/presentations/');
       setPresentations(presentationsResponse.data.results || []);
     } catch (error) {
       console.error('Error saving presentation:', error);
-      setPresentationMessage('❌ Unable to save presentation. Please try again.');
+      setPresentationMessage('Unable to save presentation. Please try again.');
     } finally {
       setPresentationSaving(false);
     }
   };
 
-  // Delete presentation
   const handleDeletePresentation = async (id) => {
     if (!window.confirm('Are you sure you want to delete this presentation?')) return;
     try {
       await axios.delete('/api/presentations/' + id + '/');
       setPresentations(prev => prev.filter(p => p.id !== id));
-      setPresentationMessage('✅ Presentation deleted successfully.');
+      setPresentationMessage('Presentation deleted successfully.');
     } catch (error) {
       console.error('Error deleting presentation:', error);
-      setPresentationMessage('❌ Unable to delete presentation.');
+      setPresentationMessage('Unable to delete presentation.');
     }
   };
 
-  // ====== OPEN CRITERIA MODAL ======
   const openCriteriaModal = (criteria = null, presentationId = null) => {
-    console.log('Opening criteria modal...', { criteria, presentationId });
     if (criteria) {
       setEditingCriteria(criteria);
       setCriteriaDraft({
@@ -390,7 +474,6 @@ function CoordinatorDashboard() {
     setCriteriaMessage('');
   };
 
-  // Save criteria
   const handleSaveCriteria = async () => {
     setCriteriaSaving(true);
     setCriteriaMessage('');
@@ -406,11 +489,11 @@ function CoordinatorDashboard() {
       if (editingCriteria) {
         response = await axios.put('/api/presentation-criteria/' + editingCriteria.id + '/', data);
         setCriteriaList(prev => prev.map(c => c.id === editingCriteria.id ? response.data : c));
-        setCriteriaMessage('✅ Criteria updated successfully.');
+        setCriteriaMessage('Criteria updated successfully.');
       } else {
         response = await axios.post('/api/presentation-criteria/', data);
         setCriteriaList(prev => [...prev, response.data]);
-        setCriteriaMessage('✅ Criteria created successfully.');
+        setCriteriaMessage('Criteria created successfully.');
       }
       setShowCriteriaModal(false);
       if (data.presentation) {
@@ -418,13 +501,12 @@ function CoordinatorDashboard() {
       }
     } catch (error) {
       console.error('Error saving criteria:', error);
-      setCriteriaMessage('❌ Unable to save criteria. Please try again.');
+      setCriteriaMessage('Unable to save criteria. Please try again.');
     } finally {
       setCriteriaSaving(false);
     }
   };
 
-  // Delete criteria
   const handleDeleteCriteria = async (id) => {
     if (!window.confirm('Are you sure you want to delete this criteria?')) return;
     try {
@@ -432,17 +514,16 @@ function CoordinatorDashboard() {
       const presentationId = criteria?.presentation;
       await axios.delete('/api/presentation-criteria/' + id + '/');
       setCriteriaList(prev => prev.filter(c => c.id !== id));
-      setCriteriaMessage('✅ Criteria deleted successfully.');
+      setCriteriaMessage('Criteria deleted successfully.');
       if (presentationId) {
         await fetchCriteria(presentationId);
       }
     } catch (error) {
       console.error('Error deleting criteria:', error);
-      setCriteriaMessage('❌ Unable to delete criteria.');
+      setCriteriaMessage('Unable to delete criteria.');
     }
   };
 
-  // Add option to criteria
   const handleAddOption = () => {
     setCriteriaDraft(prev => ({
       ...prev,
@@ -467,7 +548,6 @@ function CoordinatorDashboard() {
     }));
   };
 
-  // Open grading form
   const openGradingForm = async (presentationId) => {
     setSelectedPresentationForGrading(presentationId);
     setGradingStudent(null);
@@ -480,7 +560,6 @@ function CoordinatorDashboard() {
     await fetchPresentationStudents(presentationId);
   };
 
-  // Handle student selection in grading form
   const handleStudentSelect = async (studentId) => {
     const student = presentationStudents.find(s => s.id === parseInt(studentId));
     if (!student) return;
@@ -515,10 +594,9 @@ function CoordinatorDashboard() {
     }
   };
 
-  // Save grades
   const handleSaveStudentGrade = async () => {
     if (!gradingStudent) {
-      setGradingMessage('❌ Please select a student first.');
+      setGradingMessage('Please select a student first.');
       return;
     }
 
@@ -576,19 +654,18 @@ function CoordinatorDashboard() {
 
       await axios.post('/api/presentation-results/' + resultId + '/calculate_total/');
       
-      setGradingMessage('✅ Grades saved successfully.');
+      setGradingMessage('Grades saved successfully.');
       setTimeout(() => {
         setShowGradeModal(false);
       }, 1500);
     } catch (error) {
       console.error('Error saving grades:', error);
-      setGradingMessage('❌ Unable to save grades. Please try again.');
+      setGradingMessage('Unable to save grades. Please try again.');
     } finally {
       setGradingSaving(false);
     }
   };
 
-  // Toggle presentations
   const togglePresentations = () => {
     setExpandedPresentations(!expandedPresentations);
     if (!expandedPresentations) {
@@ -605,6 +682,147 @@ function CoordinatorDashboard() {
   };
 
   // ==================== END PRESENTATION CRITERIA FUNCTIONS ====================
+
+  // ==================== BULK OPERATIONS FUNCTIONS ====================
+
+  const handleSelectProject = (projectId) => {
+    setSelectedProjects(prev => {
+      if (prev.includes(projectId)) {
+        return prev.filter(id => id !== projectId);
+      } else {
+        return [...prev, projectId];
+      }
+    });
+  };
+
+  const handleSelectAll = () => {
+    if (selectAll) {
+      setSelectedProjects([]);
+    } else {
+      const allProjectIds = projects.map(p => p.id);
+      setSelectedProjects(allProjectIds);
+    }
+    setSelectAll(!selectAll);
+  };
+
+  // ====== FIX: Fetch mentors from users endpoint ======
+  const fetchAvailableMentors = async () => {
+    setLoadingMentors(true);
+    try {
+      // Fetch all mentors from users endpoint
+      const response = await axios.get('/api/users/?role=mentor');
+      const mentorsData = response.data.results || response.data || [];
+      
+      // Process mentors with capacity info
+      const processedMentors = mentorsData.map((mentor) => {
+        const currentStudents = users.filter(u => u.mentor === mentor.id && u.role === 'student').length;
+        const maxStudents = mentor.max_students || 5;
+        const availableSlots = maxStudents - currentStudents;
+        
+        return {
+          id: mentor.id,
+          name: `${mentor.first_name} ${mentor.last_name}`,
+          username: mentor.username,
+          email: mentor.email,
+          max_students: maxStudents,
+          current_students: currentStudents,
+          available_slots: availableSlots,
+          capacity_status: availableSlots <= 0 ? 'FULL' : `${availableSlots} slots left`,
+          specialization: mentor.specialization?.name || null,
+          has_specialization: true,
+          mentor_bio: mentor.mentor_bio || ''
+        };
+      }).filter(m => m.available_slots > 0);
+      
+      setAvailableMentors(processedMentors);
+    } catch (error) {
+      console.error('Error fetching mentors:', error);
+      setAvailableMentors([]);
+    } finally {
+      setLoadingMentors(false);
+    }
+  };
+
+  const openBulkModal = async (action) => {
+    setBulkAction(action);
+    setShowBulkModal(true);
+    setBulkData({
+      status: '',
+      mentor_id: '',
+      comment: '',
+      message: ''
+    });
+    setBulkResult(null);
+    
+    if (action === 'assign_mentor' || action === 'auto_assign_mentor') {
+      await fetchAvailableMentors();
+    }
+  };
+
+  const handleBulkAction = async () => {
+    if (selectedProjects.length === 0) {
+      alert('Please select at least one project.');
+      return;
+    }
+
+    setBulkLoading(true);
+    setBulkResult(null);
+
+    try {
+      const payload = {
+        action: bulkAction,
+        project_ids: selectedProjects,
+        data: {}
+      };
+
+      if (bulkAction === 'change_status') {
+        if (!bulkData.status) {
+          alert('Please select a status.');
+          setBulkLoading(false);
+          return;
+        }
+        payload.data.status = bulkData.status;
+      }
+
+      if (bulkAction === 'reject') {
+        payload.data.comment = bulkData.comment || '';
+      }
+
+      if (bulkAction === 'assign_mentor') {
+        if (!bulkData.mentor_id) {
+          alert('Please select a mentor.');
+          setBulkLoading(false);
+          return;
+        }
+        payload.data.mentor_id = parseInt(bulkData.mentor_id);
+      }
+
+      // CoordinatorDashboard.js - Hakikisha URL ni sahihi
+      const response = await axios.post('/api/projects/bulk_action/', payload);
+      setBulkResult(response.data);
+      
+      const projectsResponse = await axios.get('/api/projects/');
+      setProjects(projectsResponse.data.results || []);
+      
+      const usersResponse = await axios.get('/api/users/');
+      setUsers(usersResponse.data.results || []);
+      
+      setSelectedProjects([]);
+      setSelectAll(false);
+      setAvailableMentors([]);
+
+    } catch (error) {
+      console.error('Bulk action error:', error);
+      setBulkResult({
+        success: false,
+        error: error.response?.data?.error || error.message
+      });
+    } finally {
+      setBulkLoading(false);
+    }
+  };
+
+  // ==================== END BULK OPERATIONS FUNCTIONS ====================
 
   const handleLogout = () => {
     logout();
@@ -726,7 +944,10 @@ function CoordinatorDashboard() {
       last_name: userItem.last_name || '',
       email: userItem.email || '',
       registration_number: userItem.registration_number || '',
-      mentor: userItem.mentor || userItem.mentor_info?.id || null
+      mentor: userItem.mentor || userItem.mentor_info?.id || null,
+      max_students: userItem.max_students || 5,
+      specialization: userItem.specialization || null,
+      mentor_bio: userItem.mentor_bio || ''
     });
     setUserPassword({ current_password: '', new_password: '', confirm_password: '' });
     setUserMessage('');
@@ -771,9 +992,16 @@ function CoordinatorDashboard() {
         last_name: userDraft.last_name,
         email: userDraft.email,
       };
+      
       if (selectedUser.role === 'student') {
         payload.registration_number = userDraft.registration_number;
         payload.mentor = userDraft.mentor || null;
+      }
+      
+      if (selectedUser.role === 'mentor') {
+        payload.max_students = userDraft.max_students || 5;
+        payload.specialization = userDraft.specialization || null;
+        payload.mentor_bio = userDraft.mentor_bio || '';
       }
 
       const response = await axios.patch('/api/users/' + selectedUser.id + '/', payload);
@@ -933,10 +1161,10 @@ function CoordinatorDashboard() {
       setSelectedProject((prevProject) =>
         prevProject && prevProject.id === projectId ? { ...prevProject, ...response.data } : prevProject
       );
-      setProjectMessage('✅ Project status updated successfully.');
+      setProjectMessage('Project status updated successfully.');
     } catch (error) {
       console.error('Error updating project status:', error);
-      setProjectMessage('❌ Unable to update project status. Please try again.');
+      setProjectMessage('Unable to update project status. Please try again.');
     } finally {
       setProjectSaving(false);
     }
@@ -959,7 +1187,6 @@ function CoordinatorDashboard() {
 
   return (
     <div className="dashboard-container admin-dashboard">
-      {/* Navbar */}
       <nav className="navbar navbar-expand-lg navbar-light bg-white fixed-top">
         <div className="container-fluid">
           <span className="navbar-brand d-flex align-items-center">
@@ -1015,7 +1242,6 @@ function CoordinatorDashboard() {
       </nav>
 
       <div className="container mt-5">
-        {/* Welcome Section */}
         <div className="welcome-section">
           <h1>
             Welcome back, <span className="role-name">{profile.first_name || profile.username || 'Coordinator'}</span>.
@@ -1065,7 +1291,6 @@ function CoordinatorDashboard() {
 
         <div className="row mt-5">
 
-          {/* Profile Modal */}
           {profileExpanded && (
             <div style={{
               position: 'fixed',
@@ -1090,9 +1315,9 @@ function CoordinatorDashboard() {
                 boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
               }} onClick={(e) => e.stopPropagation()}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                  <h5 style={{ margin: 0 }}>👤 Profile Settings</h5>
+                  <h5 style={{ margin: 0 }}>Profile Settings</h5>
                   <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setProfileExpanded(false)}>
-                    ✕
+                    X
                   </button>
                 </div>
                 <hr />
@@ -1169,7 +1394,6 @@ function CoordinatorDashboard() {
             </div>
           )}
 
-          {/* Change Password Modal */}
           {showChangePassword && (
             <div style={{
               position: 'fixed',
@@ -1194,9 +1418,9 @@ function CoordinatorDashboard() {
                 boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
               }} onClick={(e) => e.stopPropagation()}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-                  <h5 style={{ margin: 0 }}>🔒 Change Password</h5>
+                  <h5 style={{ margin: 0 }}>Change Password</h5>
                   <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowChangePassword(false)}>
-                    ✕
+                    X
                   </button>
                 </div>
                 <hr />
@@ -1260,7 +1484,6 @@ function CoordinatorDashboard() {
             </div>
           )}
 
-          {/* Users Section */}
           <div className="col-md-12 mb-4">
             <div className="card dashboard-card">
               <div className="card-body">
@@ -1269,7 +1492,7 @@ function CoordinatorDashboard() {
                   onClick={toggleUsers}
                 >
                   <div>
-                    <h5 className="card-title" style={{ marginBottom: 0 }}>👥 Manage Users</h5>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>Manage Users</h5>
                     <p className="card-text">View and manage all system users</p>
                   </div>
                   <span
@@ -1292,7 +1515,7 @@ function CoordinatorDashboard() {
                     ) : (
                       <>
                         <div className="mb-4">
-                          <h6>👨‍🏫 Mentors</h6>
+                          <h6>Mentors</h6>
                           {mentors.length > 0 ? (
                             <div className="table-responsive">
                               <table className="table table-striped">
@@ -1301,22 +1524,35 @@ function CoordinatorDashboard() {
                                     <th>Name</th>
                                     <th>Username</th>
                                     <th>Email</th>
+                                    <th>Specialization</th>
+                                    <th>Students</th>
+                                    <th>Capacity</th>
                                     <th>Actions</th>
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {mentors.map((mentor) => (
-                                    <tr key={mentor.id}>
-                                      <td>{mentor.first_name} {mentor.middle_name || ''} {mentor.last_name}</td>
-                                      <td>{mentor.username}</td>
-                                      <td>{mentor.email}</td>
-                                      <td>
-                                        <button className="btn btn-sm btn-primary" onClick={() => openUserModal(mentor)}>
-                                          ✏️ Edit
-                                        </button>
-                                      </td>
-                                    </tr>
-                                  ))}
+                                  {mentors.map((mentor) => {
+                                    const capacity = getMentorCapacityStatus(mentor);
+                                    return (
+                                      <tr key={mentor.id}>
+                                        <td>{mentor.first_name} {mentor.middle_name || ''} {mentor.last_name}</td>
+                                        <td>{mentor.username}</td>
+                                        <td>{mentor.email}</td>
+                                        <td>{mentor.specialization?.name || 'General'}</td>
+                                        <td>{capacity.current}</td>
+                                        <td>
+                                          <span className={capacity.isFull ? 'text-danger' : 'text-success'}>
+                                            {capacity.status}
+                                          </span>
+                                        </td>
+                                        <td>
+                                          <button className="btn btn-sm btn-primary" onClick={() => openUserModal(mentor)}>
+                                            Edit
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
                                 </tbody>
                               </table>
                             </div>
@@ -1326,7 +1562,7 @@ function CoordinatorDashboard() {
                         </div>
 
                         <div>
-                          <h6>👨‍🎓 Students</h6>
+                          <h6>Students</h6>
                           {students.length > 0 ? (
                             <div className="table-responsive">
                               <table className="table table-striped">
@@ -1350,7 +1586,7 @@ function CoordinatorDashboard() {
                                       <td>{student.mentor_info ? student.mentor_info.first_name + ' ' + student.mentor_info.last_name : 'Not assigned'}</td>
                                       <td>
                                         <button className="btn btn-sm btn-primary" onClick={() => openUserModal(student)}>
-                                          ✏️ Edit
+                                          Edit
                                         </button>
                                       </td>
                                     </tr>
@@ -1371,7 +1607,6 @@ function CoordinatorDashboard() {
           </div>
         </div>
 
-        {/* User Modal */}
         {showUserModal && selectedUser && (
           <div style={{
             position: 'fixed',
@@ -1397,11 +1632,11 @@ function CoordinatorDashboard() {
             }} onClick={(e) => e.stopPropagation()}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
                 <div>
-                  <h5 style={{ margin: 0 }}>✏️ Edit User Profile</h5>
+                  <h5 style={{ margin: 0 }}>Edit User Profile</h5>
                   <small className="text-muted">{selectedUser.username} ({selectedUser.role})</small>
                 </div>
                 <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={closeUserModal}>
-                  ✕
+                  X
                 </button>
               </div>
               <hr />
@@ -1467,25 +1702,97 @@ function CoordinatorDashboard() {
                         onChange={handleUserDraftChange}
                       >
                         <option value="">No mentor assigned</option>
-                        {mentors.map((mentor) => (
-                          <option key={mentor.id} value={mentor.id}>
-                            {mentor.first_name} {mentor.middle_name || ''} {mentor.last_name}
+                        {mentors.map((mentor) => {
+                          const capacity = getMentorCapacityStatus(mentor);
+                          return (
+                            <option key={mentor.id} value={mentor.id} disabled={capacity.isFull}>
+                              {mentor.first_name} {mentor.last_name} 
+                              ({capacity.current}/{capacity.max} students {capacity.isFull ? '- FULL' : ''})
+                            </option>
+                          );
+                        })}
+                      </select>
+                      {userDraft.mentor && (
+                        <small className="text-muted d-block mt-1">
+                          {(() => {
+                            const selected = mentors.find(m => m.id === parseInt(userDraft.mentor));
+                            if (selected) {
+                              const cap = getMentorCapacityStatus(selected);
+                              return cap.isFull ? 'Warning: This mentor is full.' : `${cap.available} slots available.`;
+                            }
+                            return '';
+                          })()}
+                        </small>
+                      )}
+                    </div>
+                  </>
+                )}
+                {selectedUser.role === 'mentor' && (
+                  <>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Max Students</strong></label>
+                      <input
+                        type="number"
+                        name="max_students"
+                        className="form-control"
+                        value={userDraft.max_students || 5}
+                        onChange={handleUserDraftChange}
+                        min="1"
+                        max="20"
+                      />
+                      <small className="text-muted">Maximum number of students this mentor can handle</small>
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Specialization</strong></label>
+                      <select
+                        name="specialization"
+                        className="form-select"
+                        value={userDraft.specialization || ''}
+                        onChange={handleUserDraftChange}
+                      >
+                        <option value="">General (No specialization)</option>
+                        {projectTypes.map((pt) => (
+                          <option key={pt.id} value={pt.id}>
+                            {pt.name}
                           </option>
                         ))}
                       </select>
+                      <small className="text-muted">Select ONE project type this mentor specializes in</small>
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Mentor Bio</strong></label>
+                      <textarea
+                        name="mentor_bio"
+                        className="form-control"
+                        rows="3"
+                        value={userDraft.mentor_bio || ''}
+                        onChange={handleUserDraftChange}
+                        placeholder="Brief description of mentor's expertise..."
+                      />
+                      <small className="text-muted">Brief description of mentor's expertise (optional)</small>
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Current Students</strong></label>
+                      <input
+                        type="text"
+                        className="form-control"
+                        value={users.filter(u => u.mentor === selectedUser.id && u.role === 'student').length || 0}
+                        disabled
+                        style={{ backgroundColor: '#e9ecef' }}
+                      />
                     </div>
                   </>
                 )}
                 <div className="d-flex gap-2 mb-3">
                   <button className="btn btn-primary" onClick={handleSaveUser} disabled={userSaving}>
-                    {userSaving ? 'Saving...' : '💾 Save User'}
+                    {userSaving ? 'Saving...' : 'Save User'}
                   </button>
                   <button className="btn btn-outline-secondary" onClick={closeUserModal} disabled={userSaving}>
                     Cancel
                   </button>
                 </div>
                 <hr />
-                <h6>🔑 Password</h6>
+                <h6>Password</h6>
                 {selectedUser.id === user.id && (
                   <div className="mb-3">
                     <label className="form-label"><strong>Current Password</strong></label>
@@ -1520,7 +1827,7 @@ function CoordinatorDashboard() {
                 </div>
                 <div className="d-flex gap-2">
                   <button className="btn btn-secondary" onClick={handleSaveUserPassword} disabled={userPasswordSaving}>
-                    {userPasswordSaving ? 'Saving...' : '💾 Save Password'}
+                    {userPasswordSaving ? 'Saving...' : 'Save Password'}
                   </button>
                 </div>
                 {userMessage && <p className={'mt-3 ' + (userMessage.includes('successfully') ? 'text-success' : 'text-danger')}>{userMessage}</p>}
@@ -1529,7 +1836,6 @@ function CoordinatorDashboard() {
           </div>
         )}
 
-        {/* ==================== PRESENTATIONS SECTION ==================== */}
         <div className="row mt-4">
           <div className="col-md-12">
             <div className="card dashboard-card">
@@ -1539,7 +1845,7 @@ function CoordinatorDashboard() {
                   onClick={togglePresentations}
                 >
                   <div>
-                    <h5 className="card-title" style={{ marginBottom: 0 }}>📊 Presentation Management</h5>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>Presentation Management</h5>
                     <p className="card-text">Manage presentations, criteria, and grading</p>
                   </div>
                   <div className="d-flex align-items-center gap-2">
@@ -1581,7 +1887,7 @@ function CoordinatorDashboard() {
                                 <div>
                                   <h6 className="mb-1">{presentation.name || 'Presentation ' + presentation.id}</h6>
                                   <small className="text-muted">
-                                    📅 {presentation.presentation_date ? new Date(presentation.presentation_date).toLocaleDateString() : 'Date TBD'} | 
+                                    {presentation.presentation_date ? new Date(presentation.presentation_date).toLocaleDateString() : 'Date TBD'} | 
                                     Total: {presentation.total_marks} | 
                                     Pass: {presentation.pass_marks}
                                   </small>
@@ -1594,34 +1900,33 @@ function CoordinatorDashboard() {
                                     className="btn btn-sm btn-outline-primary"
                                     onClick={() => fetchCriteria(presentation.id)}
                                   >
-                                    📋 Criteria
+                                    Criteria
                                   </button>
                                   <button 
                                     className="btn btn-sm btn-success"
                                     onClick={() => openGradingForm(presentation.id)}
                                   >
-                                    🎯 Grade Students
+                                    Grade Students
                                   </button>
                                   <button 
                                     className="btn btn-sm btn-outline-success"
                                     onClick={() => openPresentationModal(presentation)}
                                   >
-                                    ✏️ Edit
+                                    Edit
                                   </button>
                                   <button 
                                     className="btn btn-sm btn-outline-danger"
                                     onClick={() => handleDeletePresentation(presentation.id)}
                                   >
-                                    🗑️ Delete
+                                    Delete
                                   </button>
                                 </div>
                               </div>
 
-                              {/* Display Criteria */}
                               {expandedCriteria[presentation.id] && (
                                 <div className="mt-3">
                                   <div className="d-flex justify-content-between align-items-center">
-                                    <h6 className="mb-2">📋 Criteria</h6>
+                                    <h6 className="mb-2">Criteria</h6>
                                     <button 
                                       className="btn btn-sm btn-primary"
                                       onClick={() => openCriteriaModal(null, presentation.id)}
@@ -1649,13 +1954,13 @@ function CoordinatorDashboard() {
                                                   className="btn btn-sm btn-outline-secondary"
                                                   onClick={() => openCriteriaModal(criteria)}
                                                 >
-                                                  ✏️ Edit
+                                                  Edit
                                                 </button>
                                                 <button 
                                                   className="btn btn-sm btn-outline-danger"
                                                   onClick={() => handleDeleteCriteria(criteria.id)}
                                                 >
-                                                  🗑️
+                                                  Delete
                                                 </button>
                                               </div>
                                             </div>
@@ -1680,9 +1985,7 @@ function CoordinatorDashboard() {
             </div>
           </div>
         </div>
-        {/* ==================== END PRESENTATIONS SECTION ==================== */}
 
-        {/* Projects Section */}
         <div className="row mt-4">
           <div className="col-md-12">
             <div className="card dashboard-card">
@@ -1692,14 +1995,14 @@ function CoordinatorDashboard() {
                   onClick={toggleProjects}
                 >
                   <div>
-                    <h5 className="card-title" style={{ marginBottom: 0 }}>📋 Unflagged Projects</h5>
-                    <p className="card-text">Review and manage projects that are not flagged as duplicates</p>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>Projects</h5>
+                    <p className="card-text">Manage projects with bulk operations</p>
                   </div>
                   <span
                     style={{
                       fontSize: '1.5em',
                       color: '#2a2d30',
-                      transform: expandedProjects ? 'rotate(360deg)' : 'rotate(-90deg)',
+                      transform: expandedProjects ? 'rotate(0deg)' : 'rotate(-90deg)',
                       transition: 'transform 0.05s ease'
                     }}
                   >
@@ -1710,45 +2013,179 @@ function CoordinatorDashboard() {
                 {expandedProjects && (
                   <>
                     <hr />
+                    
+                    {projects.length > 0 && (
+                      <div className="mb-3 p-2 bg-light rounded d-flex flex-wrap align-items-center gap-2">
+                        <div className="d-flex align-items-center me-2">
+                          <input
+                            type="checkbox"
+                            className="form-check-input me-2"
+                            checked={selectAll}
+                            onChange={handleSelectAll}
+                          />
+                          <span className="small">
+                            {selectedProjects.length} / {projects.length} selected
+                          </span>
+                        </div>
+                        
+                        <div className="d-flex flex-wrap gap-2">
+                          <button
+                            className="btn btn-sm btn-success"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('approve')}
+                          >
+                            Approve
+                          </button>
+                          <button
+                            className="btn btn-sm btn-danger"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('reject')}
+                          >
+                            Reject
+                          </button>
+                          <button
+                            className="btn btn-sm btn-primary"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('change_status')}
+                          >
+                            Change Status
+                          </button>
+                          <button
+                            className="btn btn-sm btn-warning"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('assign_mentor')}
+                          >
+                            Assign Mentor
+                          </button>
+                          <button
+                            className="btn btn-sm btn-info"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('auto_assign_mentor')}
+                          >
+                            Auto Assign Mentor
+                          </button>
+                          <button
+                            className="btn btn-sm btn-outline-secondary"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('export')}
+                          >
+                            Export
+                          </button>
+                          <button
+                            className="btn btn-sm btn-outline-danger"
+                            disabled={selectedProjects.length === 0}
+                            onClick={() => openBulkModal('delete')}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
                     {loading ? (
                       <p>Loading projects...</p>
                     ) : projects.length > 0 ? (
-                      <>
-                        <div>
-                          <h6>Unflagged Projects</h6>
-                          {normalProjects.length > 0 ? (
-                            <div className="list-group">
-                              {normalProjects.map((project) => (
-                                <div
-                                  key={project.id}
-                                  className="list-group-item"
-                                  style={{ cursor: 'pointer' }}
-                                  onClick={() => openProjectDetails(project)}
-                                >
-                                  <div className="d-flex justify-content-between align-items-center">
-                                    <div>
-                                      <h6>{project.title}</h6>
-                                      <p className="mb-1">
-                                        <strong>Status:</strong> {project.status}
-                                      </p>
-                                      <small className="text-muted">
-                                        Type: {project.project_type_name || 'N/A'} | Year: {project.year}
-                                      </small>
+                      <div className="table-responsive">
+                        <table className="table table-hover">
+                          <thead>
+                            <tr>
+                              <th style={{ width: '40px' }}>
+                                <input
+                                  type="checkbox"
+                                  className="form-check-input"
+                                  checked={selectAll}
+                                  onChange={handleSelectAll}
+                                />
+                              </th>
+                              <th>Title</th>
+                              <th>Students & Mentors</th>
+                              <th>Status</th>
+                              <th>Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {projects.map((project) => {
+                              const projectStudents = getProjectStudentsWithMentors(project.id);
+                              const hasAssignedMentors = projectStudents.some(s => s.mentor !== null);
+                              
+                              return (
+                                <tr key={project.id}>
+                                  <td>
+                                    <input
+                                      type="checkbox"
+                                      className="form-check-input"
+                                      checked={selectedProjects.includes(project.id)}
+                                      onChange={() => handleSelectProject(project.id)}
+                                    />
+                                  </td>
+                                  <td>
+                                    <div 
+                                      style={{ cursor: 'pointer', color: '#0d6efd' }}
+                                      onClick={() => openProjectDetails(project)}
+                                    >
+                                      {project.title}
                                     </div>
-                                    <i className="bi bi-eye" style={{ fontSize: '1.4em', color: '#007bff' }}></i>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <p>No non-flagged projects found.</p>
-                          )}
-                        </div>
-                      </>
+                                  </td>
+                                  <td>
+                                    {projectStudents.length > 0 ? (
+                                      <div style={{ fontSize: '0.85rem' }}>
+                                        {projectStudents.map((student) => (
+                                          <div key={student.id} className="mb-1">
+                                            <span className="fw-bold">{student.name}</span>
+                                            {student.registration_number !== 'N/A' && (
+                                              <span className="text-muted ms-1">({student.registration_number})</span>
+                                            )}
+                                            {student.mentor ? (
+                                              <span className="text-success ms-2">
+                                                Mentor: {student.mentor.name}
+                                              </span>
+                                            ) : (
+                                              <span className="text-danger ms-2">
+                                                No mentor assigned
+                                              </span>
+                                            )}
+                                            {student.role === 'owner' && (
+                                              <span className="badge bg-primary ms-1">Owner</span>
+                                            )}
+                                          </div>
+                                        ))}
+                                        {!hasAssignedMentors && (
+                                          <div className="text-warning small mt-1">
+                                            No mentors assigned to any student
+                                          </div>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <span className="text-muted">No students assigned</span>
+                                    )}
+                                  </td>
+                                  <td>
+                                    <span className={`badge ${
+                                      project.status === 'approved' ? 'bg-success' :
+                                      project.status === 'rejected' ? 'bg-danger' :
+                                      project.status === 'completed' ? 'bg-info' :
+                                      'bg-secondary'
+                                    }`}>
+                                      {project.status}
+                                    </span>
+                                  </td>
+                                  <td>
+                                    <button 
+                                      className="btn btn-sm btn-outline-primary"
+                                      onClick={() => openProjectDetails(project)}
+                                    >
+                                      View
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
                     ) : (
                       <p>No projects found.</p>
                     )}
-                    {projectMessage && <p className="mt-3 text-success">{projectMessage}</p>}
                   </>
                 )}
               </div>
@@ -1756,7 +2193,6 @@ function CoordinatorDashboard() {
           </div>
         </div>
 
-        {/* Duplicate Review Section */}
         <div className="row mt-4">
           <div className="col-md-12">
             <div className="card dashboard-card">
@@ -1766,7 +2202,7 @@ function CoordinatorDashboard() {
                   onClick={toggleDuplicates}
                 >
                   <div>
-                    <h5 className="card-title" style={{ marginBottom: 0 }}>⚠️ Duplicate Review</h5>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>Duplicate Review</h5>
                     <p className="card-text">Review and manage flagged duplicate projects</p>
                   </div>
                   <span
@@ -1828,7 +2264,6 @@ function CoordinatorDashboard() {
           </div>
         </div>
 
-        {/* Mentees Section */}
         <div className="row mt-4">
           <div className="col-md-12">
             <div className="card dashboard-card">
@@ -1838,7 +2273,7 @@ function CoordinatorDashboard() {
                   onClick={toggleMentees}
                 >
                   <div>
-                    <h5 className="card-title" style={{ marginBottom: 0 }}>👨‍🎓 My Mentees</h5>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>My Mentees</h5>
                     <p className="card-text">View and manage your assigned students</p>
                   </div>
                   <span
@@ -1878,7 +2313,6 @@ function CoordinatorDashboard() {
           </div>
         </div>
 
-        {/* Mentee Projects Section */}
         <div className="row mt-4">
           <div className="col-md-12">
             <div className="card dashboard-card">
@@ -1888,7 +2322,7 @@ function CoordinatorDashboard() {
                   onClick={toggleMentorProjects}
                 >
                   <div>
-                    <h5 className="card-title" style={{ marginBottom: 0 }}>📁 My Mentee Projects</h5>
+                    <h5 className="card-title" style={{ marginBottom: 0 }}>My Mentee Projects</h5>
                     <p className="card-text">Review projects from your assigned students</p>
                   </div>
                   <span
@@ -1951,12 +2385,11 @@ function CoordinatorDashboard() {
           </div>
         </div>
 
-        {/* Settings Section */}
         <div className="row mt-4">
           <div className="col-md-6">
             <div className="card dashboard-card">
               <div className="card-body">
-                <h5 className="card-title">⚙️ Settings</h5>
+                <h5 className="card-title">Settings</h5>
                 <p className="card-text">Configure system settings and parameters</p>
                 <button className="btn btn-secondary" onClick={() => { setShowSettingsModal(true); setSettingsMessage(''); }}>
                   Open Settings
@@ -1968,10 +2401,20 @@ function CoordinatorDashboard() {
           <div className="col-md-6">
             <div className="card dashboard-card">
               <div className="card-body">
-                <h5 className="card-title">🔄 Bulk Operations</h5>
+                <h5 className="card-title">Bulk Operations</h5>
                 <p className="card-text">Perform bulk operations like mentor assignment and data export</p>
-                <button className="btn btn-secondary" disabled>
-                  Coming Soon
+                <button 
+                  className="btn btn-primary" 
+                  onClick={() => {
+                    setExpandedProjects(true);
+                    if (projects.length > 0) {
+                      const allProjectIds = projects.map(p => p.id);
+                      setSelectedProjects(allProjectIds);
+                      setSelectAll(true);
+                    }
+                  }}
+                >
+                  Select All Projects for Bulk Actions
                 </button>
               </div>
             </div>
@@ -1979,7 +2422,6 @@ function CoordinatorDashboard() {
         </div>
       </div>
 
-      {/* ==================== PRESENTATION MODAL ==================== */}
       {showPresentationModal && (
         <div style={{
           position: 'fixed',
@@ -2004,9 +2446,9 @@ function CoordinatorDashboard() {
             boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
           }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-              <h5 style={{ margin: 0 }}>{selectedPresentation ? '✏️ Edit Presentation' : '➕ New Presentation'}</h5>
+              <h5 style={{ margin: 0 }}>{selectedPresentation ? 'Edit Presentation' : 'New Presentation'}</h5>
               <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowPresentationModal(false)}>
-                ✕
+                X
               </button>
             </div>
             <hr />
@@ -2070,13 +2512,12 @@ function CoordinatorDashboard() {
                   Cancel
                 </button>
               </div>
-              {presentationMessage && <p className={'mt-3 ' + (presentationMessage.includes('✅') ? 'text-success' : 'text-danger')}>{presentationMessage}</p>}
+              {presentationMessage && <p className={'mt-3 ' + (presentationMessage.includes('successfully') ? 'text-success' : 'text-danger')}>{presentationMessage}</p>}
             </div>
           </div>
         </div>
       )}
 
-      {/* ==================== CRITERIA MODAL ==================== */}
       {showCriteriaModal && (
         <div style={{
           position: 'fixed',
@@ -2101,9 +2542,9 @@ function CoordinatorDashboard() {
             boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
           }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-              <h5 style={{ margin: 0 }}>{editingCriteria ? '✏️ Edit Criteria' : '➕ New Criteria'}</h5>
+              <h5 style={{ margin: 0 }}>{editingCriteria ? 'Edit Criteria' : 'New Criteria'}</h5>
               <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowCriteriaModal(false)}>
-                ✕
+                X
               </button>
             </div>
             <hr />
@@ -2115,7 +2556,7 @@ function CoordinatorDashboard() {
                   className="form-control"
                   value={criteriaDraft.name}
                   onChange={(e) => setCriteriaDraft({ ...criteriaDraft, name: e.target.value })}
-                  placeholder="e.g., Comment Implementation, Type, Practical Progress"
+                  placeholder="e.g., Implementation, Type, Practical Progress"
                 />
               </div>
               <div className="mb-3">
@@ -2173,7 +2614,6 @@ function CoordinatorDashboard() {
                 </div>
               </div>
 
-              {/* Options for dropdown type criteria */}
               <div className="mb-3">
                 <label className="form-label"><strong>Options (for dropdown/select criteria)</strong></label>
                 <div className="small text-muted mb-2">Add options like "Embedded", "Web App", "Good progress", etc.</div>
@@ -2195,7 +2635,7 @@ function CoordinatorDashboard() {
                       value={option.value}
                       onChange={(e) => handleOptionChange(index, 'value', e.target.value)}
                     />
-                    <button className="btn btn-sm btn-danger" onClick={() => handleRemoveOption(index)}>✕</button>
+                    <button className="btn btn-sm btn-danger" onClick={() => handleRemoveOption(index)}>X</button>
                   </div>
                 ))}
                 <button className="btn btn-sm btn-outline-secondary" onClick={handleAddOption}>
@@ -2211,13 +2651,12 @@ function CoordinatorDashboard() {
                   Cancel
                 </button>
               </div>
-              {criteriaMessage && <p className={'mt-3 ' + (criteriaMessage.includes('✅') ? 'text-success' : 'text-danger')}>{criteriaMessage}</p>}
+              {criteriaMessage && <p className={'mt-3 ' + (criteriaMessage.includes('successfully') ? 'text-success' : 'text-danger')}>{criteriaMessage}</p>}
             </div>
           </div>
         </div>
       )}
 
-      {/* ==================== GRADING MODAL ==================== */}
       {showGradeModal && (
         <div style={{
           position: 'fixed',
@@ -2242,9 +2681,9 @@ function CoordinatorDashboard() {
             boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
           }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-              <h5 style={{ margin: 0 }}>📊 Grade Students</h5>
+              <h5 style={{ margin: 0 }}>Grade Students</h5>
               <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowGradeModal(false)}>
-                ✕
+                X
               </button>
             </div>
             <hr />
@@ -2284,7 +2723,7 @@ function CoordinatorDashboard() {
             {gradingStudent && (
               <>
                 <hr />
-                <h6 className="mb-3">📋 Grading Criteria for {gradingStudent.first_name} {gradingStudent.last_name}</h6>
+                <h6 className="mb-3">Grading Criteria for {gradingStudent.first_name} {gradingStudent.last_name}</h6>
 
                 {criteriaList.filter(c => c.presentation === selectedPresentationForGrading).length > 0 ? (
                   criteriaList
@@ -2369,7 +2808,7 @@ function CoordinatorDashboard() {
                     })
                 ) : (
                   <div className="alert alert-warning">
-                    <p className="mb-0">⚠️ No criteria defined for this presentation.</p>
+                    <p className="mb-0">No criteria defined for this presentation.</p>
                     <button 
                       className="btn btn-sm btn-primary mt-2"
                       onClick={() => {
@@ -2384,26 +2823,25 @@ function CoordinatorDashboard() {
 
                 <div className="d-flex gap-2 mt-3">
                   <button className="btn btn-primary" onClick={handleSaveStudentGrade} disabled={gradingSaving}>
-                    {gradingSaving ? 'Saving...' : '💾 Save Presentation Marks'}
+                    {gradingSaving ? 'Saving...' : 'Save Presentation Marks'}
                   </button>
                   <button className="btn btn-outline-secondary" onClick={() => setShowGradeModal(false)}>
                     Cancel
                   </button>
                 </div>
-                {gradingMessage && <p className={'mt-3 ' + (gradingMessage.includes('✅') ? 'text-success' : 'text-danger')}>{gradingMessage}</p>}
+                {gradingMessage && <p className={'mt-3 ' + (gradingMessage.includes('successfully') ? 'text-success' : 'text-danger')}>{gradingMessage}</p>}
               </>
             )}
 
             {!gradingStudent && (
               <div className="alert alert-info">
-                <p className="mb-0">👆 Please select a student to start grading.</p>
+                <p className="mb-0">Please select a student to start grading.</p>
               </div>
             )}
           </div>
         </div>
       )}
 
-      {/* Settings Modal */}
       {showSettingsModal && (
         <div style={{
           position: 'fixed',
@@ -2428,9 +2866,9 @@ function CoordinatorDashboard() {
             boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
           }} onClick={(e) => e.stopPropagation()}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-              <h5 style={{ margin: 0 }}>⚙️ System Settings</h5>
+              <h5 style={{ margin: 0 }}>System Settings</h5>
               <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowSettingsModal(false)}>
-                ✕
+                X
               </button>
             </div>
             <hr />
@@ -2527,7 +2965,6 @@ function CoordinatorDashboard() {
         </div>
       )}
 
-      {/* Project Details Modal */}
       {showProjectDetailsModal && selectedProject && (
         <div style={{
           position: 'fixed',
@@ -2554,7 +2991,7 @@ function CoordinatorDashboard() {
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
               <h5 style={{ margin: 0 }}>{selectedProject.title}</h5>
               <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowProjectDetailsModal(false)}>
-                ✕
+                X
               </button>
             </div>
             <hr />
@@ -2594,57 +3031,43 @@ function CoordinatorDashboard() {
                 <p><strong>Flagged Duplicate:</strong> {selectedProject.is_flagged_duplicate ? 'Yes' : 'No'}</p>
               </div>
 
-              {selectedProject.is_flagged_duplicate && (
-                <div className="mb-3">
-                  <h6>🔍 Similar Projects</h6>
-                  {loadingSimilar ? (
-                    <p>Loading similar projects...</p>
-                  ) : similarProjects.length > 0 ? (
+              <div className="mb-3">
+                <h6>Students & Mentors</h6>
+                {(() => {
+                  const students = getProjectStudentsWithMentors(selectedProject.id);
+                  if (students.length === 0) {
+                    return <p className="text-muted">No students assigned to this project.</p>;
+                  }
+                  return (
                     <div className="list-group">
-                      {similarProjects.map((similarProject) => (
-                        <div key={similarProject.id} className="list-group-item">
-                          <div className="d-flex justify-content-between align-items-start">
-                            <div className="flex-grow-1">
-                              <h6 className="mb-1">{similarProject.title}</h6>
-                              <p className="mb-1">
-                                <strong>Similarity:</strong> {(similarProject.similarity_score * 100).toFixed(1)}% |
-                                <strong> Status:</strong> {similarProject.status} |
-                                <strong> Year:</strong> {similarProject.year}
-                              </p>
-                              {similarProject.reviewed && (
-                                <div className="mt-2">
-                                  <span className="badge bg-success">Reviewed</span>
-                                </div>
+                      {students.map((student) => (
+                        <div key={student.id} className="list-group-item">
+                          <div className="d-flex justify-content-between align-items-center flex-wrap">
+                            <div>
+                              <strong>{student.name}</strong>
+                              {student.registration_number !== 'N/A' && (
+                                <span className="text-muted ms-2">({student.registration_number})</span>
+                              )}
+                              {student.role === 'owner' && (
+                                <span className="badge bg-primary ms-2">Owner</span>
                               )}
                             </div>
-                            <div className="d-flex flex-column gap-2">
-                              {!similarProject.reviewed && (
-                                <button
-                                  className="btn btn-sm btn-outline-primary"
-                                  onClick={() => markFlagReviewed(similarProject.flag_id)}
-                                >
-                                  Mark Reviewed
-                                </button>
+                            <div>
+                              {student.mentor ? (
+                                <span className="text-success">
+                                  Mentor: {student.mentor.name}
+                                </span>
+                              ) : (
+                                <span className="text-danger">No mentor assigned</span>
                               )}
-                              <button
-                                className="btn btn-sm btn-outline-info"
-                                onClick={() => {
-                                  setShowProjectDetailsModal(false);
-                                  setTimeout(() => openProjectDetails(similarProject), 100);
-                                }}
-                              >
-                                View Details
-                              </button>
                             </div>
                           </div>
                         </div>
                       ))}
                     </div>
-                  ) : (
-                    <p className="text-muted">No similar projects found.</p>
-                  )}
-                </div>
-              )}
+                  );
+                })()}
+              </div>
 
               <div className="mb-3">
                 <label className="form-label"><strong>Change Status</strong></label>
@@ -2662,7 +3085,192 @@ function CoordinatorDashboard() {
                 </select>
               </div>
 
-              {projectMessage && <p className={'mt-3 ' + (projectMessage.includes('✅') ? 'text-success' : 'text-danger')}>{projectMessage}</p>}
+              {projectMessage && <p className={'mt-3 ' + (projectMessage.includes('successfully') ? 'text-success' : 'text-danger')}>{projectMessage}</p>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showBulkModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          backgroundColor: 'rgba(0, 0, 0, 0.5)',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          zIndex: 2000
+        }} onClick={() => !bulkLoading && setShowBulkModal(false)}>
+          <div style={{
+            backgroundColor: 'white',
+            borderRadius: '8px',
+            padding: '30px',
+            width: '90%',
+            maxWidth: '500px',
+            maxHeight: '80vh',
+            overflow: 'auto',
+            boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+          }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+              <h5 style={{ margin: 0 }}>
+                {bulkAction === 'approve' && 'Approve Projects'}
+                {bulkAction === 'reject' && 'Reject Projects'}
+                {bulkAction === 'change_status' && 'Change Status'}
+                {bulkAction === 'assign_mentor' && 'Assign Mentor'}
+                {bulkAction === 'auto_assign_mentor' && 'Auto Assign Mentor'}
+                {bulkAction === 'export' && 'Export Projects'}
+                {bulkAction === 'delete' && 'Delete Projects'}
+              </h5>
+              <button 
+                style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} 
+                onClick={() => setShowBulkModal(false)}
+                disabled={bulkLoading}
+              >
+                X
+              </button>
+            </div>
+            <hr />
+
+            <div className="mb-3">
+              <p><strong>Selected Projects:</strong> {selectedProjects.length}</p>
+              <ul className="small" style={{ maxHeight: '100px', overflow: 'auto' }}>
+                {projects
+                  .filter(p => selectedProjects.includes(p.id))
+                  .slice(0, 10)
+                  .map(p => (
+                    <li key={p.id}>{p.title}</li>
+                  ))}
+                {selectedProjects.length > 10 && (
+                  <li>... and {selectedProjects.length - 10} more</li>
+                )}
+              </ul>
+            </div>
+
+            {bulkAction === 'reject' && (
+              <div className="mb-3">
+                <label className="form-label"><strong>Rejection Comment</strong></label>
+                <textarea
+                  className="form-control"
+                  rows="3"
+                  value={bulkData.comment}
+                  onChange={(e) => setBulkData({ ...bulkData, comment: e.target.value })}
+                  placeholder="Add a comment for rejection (optional)"
+                />
+              </div>
+            )}
+
+            {bulkAction === 'change_status' && (
+              <div className="mb-3">
+                <label className="form-label"><strong>New Status</strong></label>
+                <select
+                  className="form-select"
+                  value={bulkData.status}
+                  onChange={(e) => setBulkData({ ...bulkData, status: e.target.value })}
+                >
+                  <option value="">Select status</option>
+                  <option value="proposed">Proposed</option>
+                  <option value="approved">Approved</option>
+                  <option value="rejected">Rejected</option>
+                  <option value="completed">Completed</option>
+                </select>
+              </div>
+            )}
+
+            {bulkAction === 'assign_mentor' && (
+              <div className="mb-3">
+                <label className="form-label"><strong>Select Mentor</strong></label>
+                {loadingMentors ? (
+                  <div className="text-center py-3">
+                    <div className="spinner-border text-primary" role="status">
+                      <span className="visually-hidden">Loading mentors...</span>
+                    </div>
+                  </div>
+                ) : (
+                  <select
+                    className="form-select"
+                    value={bulkData.mentor_id}
+                    onChange={(e) => setBulkData({ ...bulkData, mentor_id: e.target.value })}
+                  >
+                    <option value="">Select a mentor</option>
+                    {availableMentors.map((mentor) => (
+                      <option key={mentor.id} value={mentor.id}>
+                        {mentor.name} - {mentor.specialization || 'General'} ({mentor.capacity_status})
+                      </option>
+                    ))}
+                  </select>
+                )}
+                {bulkData.mentor_id && availableMentors.find(m => m.id === parseInt(bulkData.mentor_id)) && (
+                  <small className="text-muted d-block mt-1">
+                    {availableMentors.find(m => m.id === parseInt(bulkData.mentor_id))?.capacity_status}
+                  </small>
+                )}
+              </div>
+            )}
+
+            {bulkAction === 'auto_assign_mentor' && (
+              <div className="mb-3 alert alert-info">
+                <strong>Auto Assign</strong> - The system will automatically assign the best mentor based on specialization match and available capacity.
+                <div className="mt-2">
+                  <small>Available mentors: {availableMentors.length}</small>
+                </div>
+              </div>
+            )}
+
+            {bulkAction === 'delete' && (
+              <div className="mb-3 alert alert-danger">
+                <strong>Warning:</strong> This action will permanently delete {selectedProjects.length} project(s). This cannot be undone.
+              </div>
+            )}
+
+            {bulkResult && (
+              <div className={`alert ${bulkResult.success ? 'alert-success' : 'alert-danger'}`}>
+                {bulkResult.success ? (
+                  <>
+                    <strong>Success!</strong> {bulkResult.processed} project(s) processed successfully.
+                    {bulkResult.errors && bulkResult.errors.length > 0 && (
+                      <div className="mt-2">
+                        <small>Errors: {bulkResult.errors.length}</small>
+                      </div>
+                    )}
+                    {bulkResult.results && bulkResult.results.length > 0 && (
+                      <div className="mt-2">
+                        {bulkResult.results.slice(0, 5).map((r, i) => (
+                          <div key={i} className="small">
+                            {r.title}: {r.message}
+                          </div>
+                        ))}
+                        {bulkResult.results.length > 5 && (
+                          <div className="small text-muted">... and {bulkResult.results.length - 5} more</div>
+                        )}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <strong>Error:</strong> <span>{bulkResult.error || 'An error occurred.'}</span>
+                  </>
+                )}
+              </div>
+            )}
+
+            <div className="d-flex gap-2">
+              <button 
+                className="btn btn-primary" 
+                onClick={handleBulkAction}
+                disabled={bulkLoading}
+              >
+                {bulkLoading ? 'Processing...' : 'Confirm'}
+              </button>
+              <button 
+                className="btn btn-outline-secondary" 
+                onClick={() => setShowBulkModal(false)}
+                disabled={bulkLoading}
+              >
+                Cancel
+              </button>
             </div>
           </div>
         </div>

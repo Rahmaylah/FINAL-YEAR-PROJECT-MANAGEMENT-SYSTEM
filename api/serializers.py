@@ -65,6 +65,10 @@ class ProjectDocumentSerializer(serializers.ModelSerializer):
         return None
 
 
+# ============================================================
+# ====== FIXED: PresentationResultSerializer - WITH CRITERIA SCORES ======
+# ============================================================
+
 class PresentationResultSerializer(serializers.ModelSerializer):
     presentation_name = serializers.CharField(source='presentation.name', read_only=True)
     presentation_date = serializers.DateField(source='presentation.presentation_date', read_only=True)
@@ -107,8 +111,13 @@ class PresentationResultSerializer(serializers.ModelSerializer):
     
     def get_criteria_scores(self, obj):
         """Get criteria scores for this presentation result"""
-        scores = obj.criteria_scores.all()
-        return PresentationResultCriteriaSerializer(scores, many=True).data
+        try:
+            scores = obj.criteria_scores.all()
+            if scores.exists():
+                return PresentationResultCriteriaSerializer(scores, many=True).data
+            return []
+        except Exception:
+            return []
 
 
 class PresentationSerializer(serializers.ModelSerializer):
@@ -360,7 +369,7 @@ class ProjectSimilarSerializer(serializers.ModelSerializer):
 # ============================================================
 # MAIN PROJECT SERIALIZER WITH AUTHOR AND MENTOR INFO
 # ============================================================
-# ====== SULUHISHO: mentor_comment INAWEZA KUANDIKWA ======
+# ====== FIX: user NA user_id ZIMEONGEWA ======
 
 class ProjectSerializer(serializers.ModelSerializer):
     project_type = serializers.PrimaryKeyRelatedField(queryset=ProjectType.objects.all(), allow_null=True, required=False)
@@ -368,12 +377,14 @@ class ProjectSerializer(serializers.ModelSerializer):
     documents = serializers.SerializerMethodField()
     presentation_results = serializers.SerializerMethodField()
     
+    # ====== FIX: ADD user and user_id ======
+    user = serializers.PrimaryKeyRelatedField(read_only=True)
+    user_id = serializers.IntegerField(source='user.id', read_only=True)
+    
     # ====== AUTHOR FIELDS ======
     author_name = serializers.SerializerMethodField()
     mentor_info = serializers.SerializerMethodField()
     
-    # ====== SULUHISHO: mentor_comment HAIPO READ_ONLY ======
-    # Mentor anaweza kuandika (write), student anaweza kusoma (read)
     mentor_comment = serializers.CharField(
         allow_blank=True, 
         required=False, 
@@ -423,6 +434,8 @@ class ProjectSerializer(serializers.ModelSerializer):
         model = Project
         fields = [
             'id', 
+            'user',
+            'user_id',
             'title', 
             'project_type', 
             'project_type_name', 
@@ -441,7 +454,7 @@ class ProjectSerializer(serializers.ModelSerializer):
             'presentation_results',
             'author_name', 
             'mentor_info', 
-            'mentor_comment',  # ← HII NDIYO MENTOR COMMENT
+            'mentor_comment',
             'project_users'
         ]
         read_only_fields = [
@@ -453,8 +466,8 @@ class ProjectSerializer(serializers.ModelSerializer):
             'presentation_results',
             'author_name', 
             'mentor_info',
-            # ====== SULUHISHO: ONDOA mentor_comment KWA READ_ONLY ======
-            # 'mentor_comment',  # ← HII IMEONDOKA!
+            'user',
+            'user_id',
             'project_users'
         ]
 

@@ -53,7 +53,6 @@ function StudentDashboard() {
   const [similarProjectsExpanded, setSimilarProjectsExpanded] = useState(false);
   const [loadingSimilar, setLoadingSimilar] = useState(false);
   const [similarError, setSimilarError] = useState('');
-  const [duplicateCheckLoading, setDuplicateCheckLoading] = useState(false);
 
   // Criteria details expanded state
   const [expandedResultDetails, setExpandedResultDetails] = useState({});
@@ -113,7 +112,6 @@ function StudentDashboard() {
       if (projectsResponse.data.results && projectsResponse.data.results.length > 0) {
         const projectData = projectsResponse.data.results[0];
         
-        // ====== FETCH INDIVIDUAL PROJECT FOR FRESH DATA ======
         const individualResponse = await axios.get(`/api/projects/${projectData.id}/`);
         console.log('📌 Individual Project Response:', individualResponse.data);
         console.log('💬 mentor_comment from individual:', individualResponse.data.mentor_comment);
@@ -133,7 +131,6 @@ function StudentDashboard() {
     const fetchData = async () => {
       setLoading(true);
       try {
-        // ====== FETCH FRESH PROJECT DATA ======
         const freshProjectData = await fetchFreshProjectData();
 
         if (freshProjectData) {
@@ -142,7 +139,6 @@ function StudentDashboard() {
           console.log('🔍 is_flagged_duplicate:', freshProjectData.is_flagged_duplicate);
           setProject(freshProjectData);
           
-          // Initialize form with existing project data
           setFormData({
             title: freshProjectData.title || '',
             project_type: freshProjectData.project_type?.id || freshProjectData.project_type || '',
@@ -154,7 +150,6 @@ function StudentDashboard() {
         } else {
           console.log('⚠️ No project found for this student');
           setProject(null);
-          // Reset form for new project
           setFormData({
             title: '',
             project_type: '',
@@ -163,17 +158,14 @@ function StudentDashboard() {
             project_description: '',
             implementation_details: ''
           });
-          // Clear similar projects if no project
           setSimilarProjects([]);
           setSimilarError('');
           setSimilarProjectsExpanded(false);
         }
 
-        // Set mentor info from user - using mentor_info if available
         if (user?.mentor_info) {
           setMentor(user.mentor_info);
         } else if (user?.mentor) {
-          // If only mentor ID is available, fetch the mentor details
           try {
             const mentorResponse = await axios.get(`/api/users/${user.mentor}/`);
             setMentor(mentorResponse.data);
@@ -192,18 +184,15 @@ function StudentDashboard() {
           });
           const results = resultResponse.data.results || resultResponse.data || [];
           
-          // Fetch presentation details and criteria for each result
           const resultsWithDetails = [];
           const presDetails = {};
           const presCriteria = {};
 
           for (const result of results) {
-            // Fetch presentation details
             try {
               const presResponse = await axios.get(`/api/presentations/${result.presentation}/`);
               presDetails[result.presentation] = presResponse.data;
               
-              // Fetch criteria for this presentation
               try {
                 const criteriaResponse = await axios.get(`/api/presentation-criteria/?presentation=${result.presentation}`);
                 const criteria = criteriaResponse.data.results || criteriaResponse.data || [];
@@ -227,6 +216,14 @@ function StudentDashboard() {
             const bDate = b.created_at ? new Date(b.created_at).getTime() : 0;
             return aDate - bDate;
           });
+          
+          console.log('📊 Sorted Results:', sortedResults);
+          console.log('📊 Criteria Scores:', sortedResults.map(r => ({
+            id: r.id,
+            marks: r.marks,
+            criteria_scores: r.criteria_scores
+          })));
+          
           setPresentationResults(sortedResults);
         } catch (error) {
           console.error('Error fetching presentation results:', error);
@@ -245,14 +242,21 @@ function StudentDashboard() {
   }, [user]);
 
   // ============================================================
-  // FETCH SIMILAR PROJECTS - USING NEW similar-all ENDPOINT
+  // FETCH SIMILAR PROJECTS
   // ============================================================
   const fetchSimilarProjects = async () => {
-    // Only fetch if project exists
     if (!project || !project.id) {
       setSimilarProjects([]);
       setSimilarError('No project to compare');
       setSimilarProjectsExpanded(false);
+      return;
+    }
+
+    if (!project.is_flagged_duplicate) {
+      console.log('🔍 Project is not flagged - hiding similar projects');
+      setSimilarProjects([]);
+      setSimilarError('No similar projects found');
+      setSimilarProjectsExpanded(true);
       return;
     }
 
@@ -261,20 +265,19 @@ function StudentDashboard() {
     setSimilarProjects([]);
 
     try {
-      // ====== USE NEW ENDPOINT: /api/projects/{id}/similar-all/ ======
       const response = await axios.get(`/api/projects/${project.id}/similar-all/`);
       console.log('🔍 === SIMILAR PROJECTS RESPONSE ===');
       console.log('Response:', response.data);
       
-      if (response.data.count === 0 || !response.data.results || response.data.results.length === 0) {
+      if (!response.data || response.data.count === 0 || !response.data.results || response.data.results.length === 0) {
+        console.log('⚠️ No similar projects found in response');
         setSimilarProjects([]);
-        setSimilarError(response.data.message || 'No similar projects found');
+        setSimilarError(response.data?.message || 'No similar projects found');
         setSimilarProjectsExpanded(true);
         setLoadingSimilar(false);
         return;
       }
 
-      // Format the data for display
       const formattedProjects = response.data.results.map((item) => ({
         id: item.id,
         title: item.title || 'Untitled Project',
@@ -290,11 +293,12 @@ function StudentDashboard() {
         project_type_name: item.project_type_name || 'N/A'
       }));
 
+      console.log('Formatted projects:', formattedProjects);
       setSimilarProjects(formattedProjects);
       setSimilarProjectsExpanded(true);
       
     } catch (error) {
-      console.error('Error fetching similar projects:', error);
+      console.error('❌ Error fetching similar projects:', error);
       if (error.response) {
         if (error.response.status === 404) {
           setSimilarError('Similar projects endpoint not found');
@@ -314,43 +318,6 @@ function StudentDashboard() {
     }
   };
 
-  // ============================================================
-  // Force duplicate check function
-  // ============================================================
-  const handleForceDuplicateCheck = async () => {
-    if (!project || !project.id) {
-      alert('⚠️ Please save your project first.');
-      return;
-    }
-
-    setDuplicateCheckLoading(true);
-    try {
-      const response = await axios.post(`/api/projects/${project.id}/duplicate_check/`);
-      console.log('Duplicate check result:', response.data);
-      
-      if (response.data.is_flagged) {
-        alert(`⚠️ Your project has been flagged as a potential duplicate!\nSimilarity score: ${(response.data.duplicate_check_score * 100).toFixed(1)}%`);
-      } else {
-        alert('✅ No duplicates found for your project.');
-      }
-      
-      // Refresh project data to get updated status
-      const freshData = await fetchFreshProjectData();
-      if (freshData) {
-        setProject(freshData);
-      }
-      
-      // Refresh similar projects
-      await fetchSimilarProjects();
-    } catch (error) {
-      console.error('Error checking duplicates:', error);
-      alert('❌ Error checking duplicates. Please try again.');
-    } finally {
-      setDuplicateCheckLoading(false);
-    }
-  };
-
-  // Toggle expanded details for a presentation result
   const toggleResultDetails = (resultId) => {
     setExpandedResultDetails(prev => ({
       ...prev,
@@ -381,7 +348,7 @@ function StudentDashboard() {
         email: response.data.email || ''
       });
       setEditingProfile(false);
-      setProfileMessage('✅ Profile updated successfully.');
+      setProfileMessage('Profile updated successfully.');
       localStorage.setItem('user', JSON.stringify({ ...user, ...response.data }));
     } catch (error) {
       console.error('Error saving profile:', error);
@@ -418,7 +385,7 @@ function StudentDashboard() {
         current_password: passwordData.current_password,
         new_password: passwordData.new_password
       });
-      setPasswordMessage('✅ Password changed successfully.');
+      setPasswordMessage('Password changed successfully.');
       setPasswordData({
         current_password: '',
         new_password: '',
@@ -494,7 +461,6 @@ function StudentDashboard() {
         response = await axios.post('/api/projects/', projectData);
       }
 
-      // ====== REFRESH PROJECT DATA AFTER SAVE ======
       const freshData = await fetchFreshProjectData();
       if (freshData) {
         setProject(freshData);
@@ -505,12 +471,12 @@ function StudentDashboard() {
       setIsEditing(false);
       
       if (response.data.is_flagged_duplicate) {
-        alert(`⚠️ Your project has been flagged as a potential duplicate!\nSimilarity score: ${(response.data.duplicate_check_score * 100).toFixed(1)}%`);
+        //alert(`⚠️ Your project has been flagged as a potential duplicate!\nSimilarity score: ${(response.data.duplicate_check_score * 100).toFixed(1)}%`);
+        alert(`Project Saved successfully`);
       } else {
-        alert('✅ Project saved successfully!');
+        alert('Project saved successfully!');
       }
       
-      // Refresh similar projects after save
       if (response.data.id) {
         setTimeout(() => {
           fetchSimilarProjects();
@@ -619,27 +585,62 @@ function StudentDashboard() {
     }
   };
 
-  // Calculate total marks from criteria scores
+  // ============================================================
+  // ====== CALCULATE TOTAL MARKS - SIMPLE SUM OF ALL SCORES ======
+  // ============================================================
   const calculateTotalFromCriteria = (result) => {
     if (!result.criteria_scores || result.criteria_scores.length === 0) {
-      return result.marks || 'N/A';
+      return result.marks !== null && result.marks !== undefined ? parseFloat(result.marks).toFixed(2) : 'N/A';
     }
     
     let total = 0;
-    let totalWeight = 0;
     
     result.criteria_scores.forEach(cs => {
       if (cs.score !== null && cs.score !== undefined) {
-        const normalizedScore = (cs.score / cs.criteria_max_score) * 100;
-        total += normalizedScore * cs.criteria_weight;
-        totalWeight += cs.criteria_weight;
+        total += parseFloat(cs.score);
       }
     });
     
-    if (totalWeight > 0) {
-      return (total / totalWeight).toFixed(2);
+    return total.toFixed(2);
+  };
+
+  // ============================================================
+  // ====== CALCULATE MAX TOTAL - SUM OF ALL MAX SCORES ======
+  // ============================================================
+  const calculateMaxTotal = (result, criteria) => {
+    if (!criteria || criteria.length === 0) {
+      return result.presentation_total_marks || 'N/A';
     }
-    return result.marks || 'N/A';
+    
+    let maxTotal = 0;
+    criteria.forEach(c => {
+      if (c.max_score !== null && c.max_score !== undefined) {
+        maxTotal += parseFloat(c.max_score);
+      }
+    });
+    
+    return maxTotal.toFixed(2);
+  };
+
+  // ============================================================
+  // ====== CHECK IF STUDENT PASSED ======
+  // ============================================================
+  const getPassStatus = (result) => {
+    const totalMarks = calculateTotalFromCriteria(result);
+    if (totalMarks === 'N/A') return { status: 'Not Graded', color: 'secondary' };
+    
+    const marks = parseFloat(totalMarks);
+    const passMarks = result.presentation_pass_marks;
+    
+    if (passMarks === null || passMarks === undefined) {
+      return { status: 'No Pass Mark Set', color: 'secondary' };
+    }
+    
+    if (marks >= passMarks) {
+      return { status: 'PASS', color: 'success' };
+    } else {
+      return { status: 'FAIL', color: 'danger' };
+    }
   };
 
   return (
@@ -673,7 +674,7 @@ function StudentDashboard() {
               aria-expanded={showUserMenu}
             >
               <span style={{ fontSize: '1rem', color: '#333' }}>
-                {profile?.username || user?.username || 'Student'}
+               {profile?.first_name || user?.firstname || 'Student'} {profile?.last_name || user?.last_name || 'Student'} ( {profile?.username || user?.username || 'Student'} )
               </span>
               <span style={{ fontSize: '0.8rem', color: '#666', transform: showUserMenu ? 'rotate(180deg)' : 'rotate(90deg)', transition: 'transform 0.3s ease', display: 'inline-block' }}>
                 Λ
@@ -761,17 +762,6 @@ function StudentDashboard() {
         <div className="card dashboard-card">
           <div className="card-body">
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginBottom: '20px', flexWrap: 'wrap' }}>
-              {/* Duplicate Check Button - Only show if project exists */}
-              {project && project.id && (
-                <button 
-                  className="btn btn-outline-warning"
-                  onClick={handleForceDuplicateCheck}
-                  disabled={duplicateCheckLoading}
-                >
-                  {duplicateCheckLoading ? '⏳ Checking...' : '🔍 Check Duplicates'}
-                </button>
-              )}
-              
               {isEditing ? (
                 <>
                   <button className="btn btn-success" onClick={handleSave}>
@@ -918,7 +908,6 @@ function StudentDashboard() {
                       {project.status}
                     </span>
                     
-                    {/* ====== DUPLICATE FLAG STATUS ====== */}
                     {project.is_flagged_duplicate ? (
                       <span className="badge bg-danger">
                         ⚠️ Flagged as Duplicate
@@ -928,12 +917,11 @@ function StudentDashboard() {
                       </span>
                     ) : (
                       project.duplicate_check_score !== null && project.duplicate_check_score !== undefined && (
-                        <span className="badge bg-success">✅ Not Flagged</span>
+                        <span className="badge bg-success">Not Flagged</span>
                       )
                     )}
                   </div>
                   
-                  {/* ====== MENTOR COMMENT - Inaonyeshwa chini ya status ====== */}
                   {project.mentor_comment && project.mentor_comment.trim() !== '' && (
                     <div className="mt-3 p-3 bg-light rounded border-start border-primary border-4">
                       <strong>💬 Mentor Comment:</strong>
@@ -953,7 +941,7 @@ function StudentDashboard() {
         </div>
 
         {/* Card 3: Similar Projects */}
-        {project && (
+        {project && project.is_flagged_duplicate && (
           <div className="card dashboard-card mt-4">
             <div className="card-body">
               <div style={{ 
@@ -995,8 +983,8 @@ function StudentDashboard() {
                       <p className="mt-2 text-muted">Searching for similar projects...</p>
                     </div>
                   ) : similarProjects.length > 0 ? (
-                    similarProjects.map((simProject) => (
-                      <div key={simProject.id} className="card mb-3 shadow-sm border-start border-primary border-4">
+                    similarProjects.map((simProject, index) => (
+                      <div key={simProject.id || index} className="card mb-3 shadow-sm border-start border-primary border-4">
                         <div className="card-body py-3 px-3">
                           <div className="d-flex justify-content-between align-items-start flex-wrap">
                             <h6 className="card-title mb-1">{simProject.title}</h6>
@@ -1019,14 +1007,12 @@ function StudentDashboard() {
                             </p>
                           )}
                           
-                          {/* Show mentor name if available */}
                           {simProject.mentor && simProject.mentor !== 'N/A' && (
                             <div className="mt-1">
                               <small className="text-muted">👨‍🏫 Mentor: {simProject.mentor}</small>
                             </div>
                           )}
                           
-                          {/* ====== SHOW MENTOR COMMENT FOR SIMILAR PROJECT ====== */}
                           {simProject.mentor_comment && (
                             <div className="mt-2 p-2 bg-light rounded border-start border-warning border-3">
                               <small>
@@ -1067,7 +1053,9 @@ function StudentDashboard() {
           </div>
         )}
 
-        {/* Card 4: Presentations with Criteria */}
+        {/* ============================================================
+            CARD 4: PRESENTATIONS & GRADES - WITH PASS/FAIL STATUS
+            ============================================================ */}
         {(project || (presentationResults && presentationResults.length > 0)) && (
           <div className="card dashboard-card mt-4">
             <div className="card-body">
@@ -1092,6 +1080,8 @@ function StudentDashboard() {
                       const criteria = presentationCriteria[result.presentation] || [];
                       const isExpanded = expandedResultDetails[result.id] || false;
                       const totalMarks = calculateTotalFromCriteria(result);
+                      const maxTotal = calculateMaxTotal(result, criteria);
+                      const passStatus = getPassStatus(result);
                       
                       return (
                         <div key={result.id} className="card mb-3 shadow-sm">
@@ -1111,25 +1101,30 @@ function StudentDashboard() {
                                   <small className="text-muted d-block">{result.project_title}</small>
                                 )}
                               </div>
-                              <div className="d-flex flex-wrap gap-2 align-items-center">
+                              <div className="d-flex flex-wrap gap-3 align-items-center">
+                                {/* Pass/Fail Status */}
                                 <div className="d-flex flex-column align-items-center">
-                                  <small className="badge bg-light text-dark border" style={{
-                                    color: (result.marks !== null && result.presentation_pass_marks !== null && !Number.isNaN(parseFloat(result.marks)) && !Number.isNaN(parseFloat(result.presentation_pass_marks)) && parseFloat(result.marks) < parseFloat(result.presentation_pass_marks))
-                                      ? '#dc3545'
-                                      : (result.marks !== null && result.presentation_pass_marks !== null && !Number.isNaN(parseFloat(result.marks)) && !Number.isNaN(parseFloat(result.presentation_pass_marks)) && parseFloat(result.marks) >= parseFloat(result.presentation_pass_marks))
-                                        ? '#198754'
-                                        : '#212529'
-                                  }}>
-                                    📊 Total: {totalMarks}
-                                  </small>
+                                  <span className={`badge bg-${passStatus.color} fs-6 px-3 py-2`}>
+                                    {passStatus.status}
+                                  </span>
                                 </div>
+                                {/* Total Marks - SIMPLE SUM */}
                                 <div className="d-flex flex-column align-items-center">
-                                  <small className="badge bg-light text-dark border">
-                                    Pass: {result.presentation_pass_marks ?? 'N/A'}
-                                  </small>
+                                  <span className="badge bg-primary fs-6 px-3 py-2">
+                                    {totalMarks}
+                                  </span>
                                 </div>
+                                {/* Pass Marks */}
                                 <div className="d-flex flex-column align-items-center">
-                                  <small className="badge bg-light text-dark border">Max: {result.presentation_total_marks ?? 'N/A'}</small>
+                                  <span className="badge bg-secondary fs-6 px-3 py-2">
+                                    Pass: {result.presentation_pass_marks !== null && result.presentation_pass_marks !== undefined ? result.presentation_pass_marks : 'N/A'}
+                                  </span>
+                                </div>
+                                {/* Max Marks - SUM OF ALL MAX SCORES */}
+                                <div className="d-flex flex-column align-items-center">
+                                  <span className="badge bg-secondary fs-6 px-3 py-2">
+                                    Max: {maxTotal}
+                                  </span>
                                 </div>
                                 {/* Toggle details button */}
                                 {criteria.length > 0 && (
@@ -1152,7 +1147,7 @@ function StudentDashboard() {
 
                             <p className="mb-0 small" style={{ fontSize: '0.75rem', color: '#000000' }}>
                               {result.created_at ? <em>📅 {new Date(result.created_at).toLocaleDateString()}</em> : 'Date unavailable'}
-                              {result.reviewer_name && <span className="ms-2">👤 {result.reviewer_name}</span>}
+                              {result.reviewer_name && <span className="ms-2">👤 Reviewer: {result.reviewer_name}</span>}
                             </p>
 
                             {/* Expanded criteria details */}
@@ -1166,18 +1161,17 @@ function StudentDashboard() {
                                         <th>Criteria</th>
                                         <th>Score</th>
                                         <th>Max</th>
+                                        <th>Weight</th>
                                         <th>Comment</th>
                                       </tr>
                                     </thead>
                                     <tbody>
                                       {criteria.map((c) => {
-                                        // Find the score for this criteria
                                         const scoreObj = result.criteria_scores?.find(cs => cs.criteria === c.id);
                                         const score = scoreObj?.score;
                                         const comment = scoreObj?.comment;
                                         const selectedOption = scoreObj?.selected_option;
                                         
-                                        // Find the option label if selected
                                         let optionLabel = null;
                                         if (selectedOption && c.options) {
                                           const option = c.options.find(o => o.label === selectedOption);
@@ -1203,7 +1197,7 @@ function StudentDashboard() {
                                                     <div className="small text-muted">({selectedOption})</div>
                                                   )}
                                                   {optionLabel && (
-                                                    <div className="small text-muted">✓ {optionLabel}</div>
+                                                    <div className="small text-success">✓ {optionLabel}</div>
                                                   )}
                                                 </span>
                                               ) : (
@@ -1211,6 +1205,7 @@ function StudentDashboard() {
                                               )}
                                             </td>
                                             <td>{c.max_score}</td>
+                                            <td>{c.weight}</td>
                                             <td>{comment || '-'}</td>
                                           </tr>
                                         );
@@ -1220,8 +1215,22 @@ function StudentDashboard() {
                                       <tr className="table-active">
                                         <td><strong>Total</strong></td>
                                         <td><strong>{totalMarks}</strong></td>
-                                        <td><strong>{result.presentation_total_marks || 'N/A'}</strong></td>
+                                        <td><strong>{maxTotal}</strong></td>
                                         <td></td>
+                                        <td></td>
+                                      </tr>
+                                      <tr className="table-active">
+                                        <td><strong>Status</strong></td>
+                                        <td colSpan="4">
+                                          <span className={`badge bg-${passStatus.color} fs-6`}>
+                                            {passStatus.status}
+                                          </span>
+                                          {passStatus.status !== 'Not Graded' && passStatus.status !== 'No Pass Mark Set' && (
+                                            <span className="ms-2 small text-muted">
+                                              (Pass mark: {result.presentation_pass_marks !== null && result.presentation_pass_marks !== undefined ? result.presentation_pass_marks : 'N/A'})
+                                            </span>
+                                          )}
+                                        </td>
                                       </tr>
                                     </tfoot>
                                   </table>
