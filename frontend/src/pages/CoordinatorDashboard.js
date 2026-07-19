@@ -107,7 +107,6 @@ function CoordinatorDashboard() {
   const [presentationSaving, setPresentationSaving] = useState(false);
   const [presentationMessage, setPresentationMessage] = useState('');
 
-  // Criteria states
   const [criteriaList, setCriteriaList] = useState([]);
   const [expandedCriteria, setExpandedCriteria] = useState({});
   const [showCriteriaModal, setShowCriteriaModal] = useState(false);
@@ -124,7 +123,6 @@ function CoordinatorDashboard() {
   const [criteriaSaving, setCriteriaSaving] = useState(false);
   const [criteriaMessage, setCriteriaMessage] = useState('');
 
-  // Result grading states
   const [showGradeModal, setShowGradeModal] = useState(false);
   const [gradingResult, setGradingResult] = useState(null);
   const [gradingScores, setGradingScores] = useState({});
@@ -133,7 +131,6 @@ function CoordinatorDashboard() {
   const [gradingStudent, setGradingStudent] = useState(null);
   const [selectedPresentationForGrading, setSelectedPresentationForGrading] = useState(null);
   const [presentationStudents, setPresentationStudents] = useState([]);
-  // ==================== END PRESENTATION CRITERIA STATES ====================
 
   // ==================== BULK OPERATIONS STATES ====================
   const [selectedProjects, setSelectedProjects] = useState([]);
@@ -150,7 +147,34 @@ function CoordinatorDashboard() {
   const [bulkResult, setBulkResult] = useState(null);
   const [availableMentors, setAvailableMentors] = useState([]);
   const [loadingMentors, setLoadingMentors] = useState(false);
-  // ==================== END BULK OPERATIONS STATES ====================
+
+  // ==================== NEW: CREATE USER STATES ====================
+  const [showCreateUserModal, setShowCreateUserModal] = useState(false);
+  const [createUserRole, setCreateUserRole] = useState('student'); // 'student' or 'mentor'
+  const [createUserData, setCreateUserData] = useState({
+    username: '',
+    password: '',
+    confirm_password: '',
+    first_name: '',
+    middle_name: '',
+    last_name: '',
+    email: '',
+    registration_number: '',
+    mentor: null,
+    max_students: 5,
+    specialization: null,
+    mentor_bio: ''
+  });
+  const [createUserLoading, setCreateUserLoading] = useState(false);
+  const [createUserMessage, setCreateUserMessage] = useState('');
+
+  // ==================== TOAST NOTIFICATION ====================
+  const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+
+  const showToast = (message, type = 'success') => {
+    setToast({ show: true, message, type });
+    setTimeout(() => setToast({ show: false, message: '', type: 'success' }), 4000);
+  };
 
   // Image error fallback
   const [imageError, setImageError] = useState(false);
@@ -242,6 +266,7 @@ function CoordinatorDashboard() {
 
       } catch (error) {
         console.error('Error fetching coordinator dashboard data:', error);
+        showToast('Error loading dashboard data', 'danger');
       } finally {
         setLoading(false);
       }
@@ -324,6 +349,112 @@ function CoordinatorDashboard() {
   };
 
   // ==================== END HELPER FUNCTIONS ====================
+
+  // ==================== NEW: CREATE USER FUNCTIONS ====================
+
+  const openCreateUserModal = (role) => {
+    setCreateUserRole(role);
+    setCreateUserData({
+      username: '',
+      password: '',
+      confirm_password: '',
+      first_name: '',
+      middle_name: '',
+      last_name: '',
+      email: '',
+      registration_number: '',
+      mentor: null,
+      max_students: 5,
+      specialization: null,
+      mentor_bio: ''
+    });
+    setCreateUserMessage('');
+    setShowCreateUserModal(true);
+  };
+
+  const handleCreateUserChange = (e) => {
+    const { name, value } = e.target;
+    setCreateUserData(prev => ({ ...prev, [name]: value }));
+  };
+
+  const handleCreateUser = async () => {
+    // Validation
+    if (!createUserData.username || !createUserData.password || !createUserData.first_name || !createUserData.last_name) {
+      setCreateUserMessage('Username, password, first name, and last name are required.');
+      return;
+    }
+
+    if (createUserData.password !== createUserData.confirm_password) {
+      setCreateUserMessage('Passwords do not match.');
+      return;
+    }
+
+    if (createUserData.password.length < 8) {
+      setCreateUserMessage('Password must be at least 8 characters long.');
+      return;
+    }
+
+    setCreateUserLoading(true);
+    setCreateUserMessage('');
+
+    try {
+      const payload = {
+        username: createUserData.username,
+        password: createUserData.password,
+        first_name: createUserData.first_name,
+        middle_name: createUserData.middle_name || '',
+        last_name: createUserData.last_name,
+        email: createUserData.email || '',
+        role: createUserRole,
+      };
+
+      // Add role-specific fields
+      if (createUserRole === 'student') {
+        payload.registration_number = createUserData.registration_number || '';
+        payload.mentor = createUserData.mentor || null;
+      } else if (createUserRole === 'mentor') {
+        payload.max_students = parseInt(createUserData.max_students) || 5;
+        payload.specialization = createUserData.specialization || null;
+        payload.mentor_bio = createUserData.mentor_bio || '';
+      }
+
+      const response = await axios.post('/api/users/', payload);
+      
+      // Refresh users list
+      const usersResponse = await axios.get('/api/users/');
+      setUsers(usersResponse.data.results || []);
+      
+      // Update stats
+      const mentors = usersResponse.data.results.filter(u => u.role === 'mentor').length;
+      const students = usersResponse.data.results.filter(u => u.role === 'student').length;
+      setStats(prev => ({
+        ...prev,
+        totalUsers: usersResponse.data.results.length,
+        mentors,
+        students
+      }));
+
+      setShowCreateUserModal(false);
+      showToast(`${createUserRole === 'mentor' ? 'Mentor' : 'Student'} created successfully!`, 'success');
+      
+    } catch (error) {
+      console.error('Error creating user:', error);
+      if (error.response?.data) {
+        if (typeof error.response.data === 'object') {
+          const errors = Object.values(error.response.data).flat().join(' ');
+          setCreateUserMessage(errors);
+        } else {
+          setCreateUserMessage(error.response.data.message || 'Unable to create user. Please try again.');
+        }
+      } else {
+        setCreateUserMessage('Unable to create user. Please try again.');
+      }
+    } finally {
+      setCreateUserLoading(false);
+    }
+  };
+
+  // ==================== END CREATE USER FUNCTIONS ====================
 
   // ==================== PRESENTATION CRITERIA FUNCTIONS ====================
 
@@ -424,6 +555,7 @@ function CoordinatorDashboard() {
       setShowPresentationModal(false);
       const presentationsResponse = await axios.get('/api/presentations/');
       setPresentations(presentationsResponse.data.results || []);
+      showToast('Presentation saved successfully!', 'success');
     } catch (error) {
       console.error('Error saving presentation:', error);
       setPresentationMessage('Unable to save presentation. Please try again.');
@@ -438,6 +570,7 @@ function CoordinatorDashboard() {
       await axios.delete('/api/presentations/' + id + '/');
       setPresentations(prev => prev.filter(p => p.id !== id));
       setPresentationMessage('Presentation deleted successfully.');
+      showToast('Presentation deleted!', 'info');
     } catch (error) {
       console.error('Error deleting presentation:', error);
       setPresentationMessage('Unable to delete presentation.');
@@ -499,6 +632,7 @@ function CoordinatorDashboard() {
       if (data.presentation) {
         await fetchCriteria(data.presentation);
       }
+      showToast('Criteria saved!', 'success');
     } catch (error) {
       console.error('Error saving criteria:', error);
       setCriteriaMessage('Unable to save criteria. Please try again.');
@@ -655,6 +789,7 @@ function CoordinatorDashboard() {
       await axios.post('/api/presentation-results/' + resultId + '/calculate_total/');
       
       setGradingMessage('Grades saved successfully.');
+      showToast('Grades saved successfully!', 'success');
       setTimeout(() => {
         setShowGradeModal(false);
       }, 1500);
@@ -705,15 +840,12 @@ function CoordinatorDashboard() {
     setSelectAll(!selectAll);
   };
 
-  // ====== FIX: Fetch mentors from users endpoint ======
   const fetchAvailableMentors = async () => {
     setLoadingMentors(true);
     try {
-      // Fetch all mentors from users endpoint
       const response = await axios.get('/api/users/?role=mentor');
       const mentorsData = response.data.results || response.data || [];
       
-      // Process mentors with capacity info
       const processedMentors = mentorsData.map((mentor) => {
         const currentStudents = users.filter(u => u.mentor === mentor.id && u.role === 'student').length;
         const maxStudents = mentor.max_students || 5;
@@ -797,7 +929,6 @@ function CoordinatorDashboard() {
         payload.data.mentor_id = parseInt(bulkData.mentor_id);
       }
 
-      // CoordinatorDashboard.js - Hakikisha URL ni sahihi
       const response = await axios.post('/api/projects/bulk_action/', payload);
       setBulkResult(response.data);
       
@@ -810,6 +941,8 @@ function CoordinatorDashboard() {
       setSelectedProjects([]);
       setSelectAll(false);
       setAvailableMentors([]);
+
+      showToast('Bulk action completed successfully!', 'success');
 
     } catch (error) {
       console.error('Bulk action error:', error);
@@ -864,6 +997,7 @@ function CoordinatorDashboard() {
         duplicate_lexical_weight: response.data.duplicate_lexical_weight
       });
       setSettingsMessage('Settings saved successfully.');
+      showToast('Settings saved!', 'success');
     } catch (error) {
       console.error('Error saving settings:', error);
       if (error.response?.data) {
@@ -891,6 +1025,7 @@ function CoordinatorDashboard() {
       setEditingProfile(false);
       setProfileMessage('Profile updated successfully.');
       localStorage.setItem('user', JSON.stringify({ ...user, ...response.data }));
+      showToast('Profile updated!', 'success');
     } catch (error) {
       console.error('Error saving profile:', error);
       setProfileMessage('Unable to update profile. Please try again.');
@@ -927,6 +1062,7 @@ function CoordinatorDashboard() {
         confirm_password: ''
       });
       setShowChangePassword(false);
+      showToast('Password changed!', 'success');
     } catch (error) {
       console.error('Error changing password:', error);
       setPasswordMessage('Unable to change password. Please check your current password.');
@@ -1027,6 +1163,7 @@ function CoordinatorDashboard() {
         : 'User information updated successfully.';
       setUserMessage(successMsg);
       setUserPassword({ current_password: '', new_password: '', confirm_password: '' });
+      showToast('User updated successfully!', 'success');
       setTimeout(() => closeUserModal(), 1500);
     } catch (error) {
       console.error('Error updating user:', error);
@@ -1057,6 +1194,7 @@ function CoordinatorDashboard() {
       }
       setUserMessage('Password changed successfully.');
       setUserPassword({ new_password: '', confirm_password: '' });
+      showToast('Password changed!', 'success');
     } catch (error) {
       console.error('Error changing user password:', error);
       setUserMessage('Unable to change password. Please try again.');
@@ -1137,6 +1275,7 @@ function CoordinatorDashboard() {
           project.flag_id === flagId ? { ...project, reviewed: true } : project
         )
       );
+      showToast('Flag marked as reviewed', 'info');
     } catch (error) {
       console.error('Error marking flag as reviewed:', error);
     }
@@ -1162,6 +1301,7 @@ function CoordinatorDashboard() {
         prevProject && prevProject.id === projectId ? { ...prevProject, ...response.data } : prevProject
       );
       setProjectMessage('Project status updated successfully.');
+      showToast('Project status updated!', 'success');
     } catch (error) {
       console.error('Error updating project status:', error);
       setProjectMessage('Unable to update project status. Please try again.');
@@ -1187,6 +1327,17 @@ function CoordinatorDashboard() {
 
   return (
     <div className="dashboard-container admin-dashboard">
+      {/* Toast Notification */}
+      {toast.show && (
+        <div className={`toast-notification toast-${toast.type}`}>
+          <span className="toast-icon">
+            {toast.type === 'success' ? '✅' : toast.type === 'danger' ? '❌' : 'ℹ️'}
+          </span>
+          <span>{toast.message}</span>
+          <button className="toast-close" onClick={() => setToast({ show: false, message: '', type: 'success' })}>×</button>
+        </div>
+      )}
+
       <nav className="navbar navbar-expand-lg navbar-light bg-white fixed-top">
         <div className="container-fluid">
           <span className="navbar-brand d-flex align-items-center">
@@ -1495,16 +1646,36 @@ function CoordinatorDashboard() {
                     <h5 className="card-title" style={{ marginBottom: 0 }}>Manage Users</h5>
                     <p className="card-text">View and manage all system users</p>
                   </div>
-                  <span
-                    style={{
-                      fontSize: '1.5em',
-                      color: '#2a2d32',
-                      transform: expandedUsers ? 'rotate(0deg)' : 'rotate(-90deg)',
-                      transition: 'transform 0.03s ease'
-                    }}
-                  >
-                    ▼
-                  </span>
+                  <div className="d-flex align-items-center gap-2">
+                    <button 
+                      className="btn btn-sm btn-success"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openCreateUserModal('mentor');
+                      }}
+                    >
+                      + Add Mentor
+                    </button>
+                    <button 
+                      className="btn btn-sm btn-primary"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        openCreateUserModal('student');
+                      }}
+                    >
+                      + Add Student
+                    </button>
+                    <span
+                      style={{
+                        fontSize: '1.5em',
+                        color: '#2a2d32',
+                        transform: expandedUsers ? 'rotate(0deg)' : 'rotate(-90deg)',
+                        transition: 'transform 0.03s ease'
+                      }}
+                    >
+                      ▼
+                    </span>
+                  </div>
                 </div>
 
                 {expandedUsers && (
@@ -1515,7 +1686,7 @@ function CoordinatorDashboard() {
                     ) : (
                       <>
                         <div className="mb-4">
-                          <h6>Mentors</h6>
+                          <h6>Mentors ({mentors.length})</h6>
                           {mentors.length > 0 ? (
                             <div className="table-responsive">
                               <table className="table table-striped">
@@ -1557,12 +1728,12 @@ function CoordinatorDashboard() {
                               </table>
                             </div>
                           ) : (
-                            <p>No mentors found.</p>
+                            <p>No mentors found. <button className="btn btn-sm btn-success" onClick={() => openCreateUserModal('mentor')}>Add a mentor</button></p>
                           )}
                         </div>
 
                         <div>
-                          <h6>Students</h6>
+                          <h6>Students ({students.length})</h6>
                           {students.length > 0 ? (
                             <div className="table-responsive">
                               <table className="table table-striped">
@@ -1595,7 +1766,7 @@ function CoordinatorDashboard() {
                               </table>
                             </div>
                           ) : (
-                            <p>No students found.</p>
+                            <p>No students found. <button className="btn btn-sm btn-primary" onClick={() => openCreateUserModal('student')}>Add a student</button></p>
                           )}
                         </div>
                       </>
@@ -1831,6 +2002,249 @@ function CoordinatorDashboard() {
                   </button>
                 </div>
                 {userMessage && <p className={'mt-3 ' + (userMessage.includes('successfully') ? 'text-success' : 'text-danger')}>{userMessage}</p>}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ==================== CREATE USER MODAL ==================== */}
+        {showCreateUserModal && (
+          <div style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+            display: 'flex',
+            justifyContent: 'center',
+            alignItems: 'center',
+            zIndex: 1000
+          }} onClick={() => !createUserLoading && setShowCreateUserModal(false)}>
+            <div style={{
+              backgroundColor: 'white',
+              borderRadius: '8px',
+              padding: '30px',
+              width: '90%',
+              maxWidth: '600px',
+              maxHeight: '90vh',
+              overflow: 'auto',
+              boxShadow: '0 4px 6px rgba(0, 0, 0, 0.1)'
+            }} onClick={(e) => e.stopPropagation()}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                <div>
+                  <h5 style={{ margin: 0 }}>Add New {createUserRole === 'mentor' ? 'Mentor' : 'Student'}</h5>
+                  <small className="text-muted">Create a new user account</small>
+                </div>
+                <button style={{ background: 'none', border: 'none', fontSize: '1.5em', cursor: 'pointer' }} onClick={() => setShowCreateUserModal(false)}>
+                  X
+                </button>
+              </div>
+              <hr />
+              <div>
+                <div className="row">
+                  <div className="col-md-6 mb-3">
+                    <label className="form-label"><strong>Username *</strong></label>
+                    <input
+                      type="text"
+                      name="username"
+                      className="form-control"
+                      value={createUserData.username}
+                      onChange={handleCreateUserChange}
+                      placeholder="Enter username"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                  <div className="col-md-6 mb-3">
+                    <label className="form-label"><strong>Email</strong></label>
+                    <input
+                      type="email"
+                      name="email"
+                      className="form-control"
+                      value={createUserData.email}
+                      onChange={handleCreateUserChange}
+                      placeholder="Enter email (optional)"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                </div>
+
+                <div className="row">
+                  <div className="col-md-4 mb-3">
+                    <label className="form-label"><strong>First Name *</strong></label>
+                    <input
+                      type="text"
+                      name="first_name"
+                      className="form-control"
+                      value={createUserData.first_name}
+                      onChange={handleCreateUserChange}
+                      placeholder="First name"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                  <div className="col-md-4 mb-3">
+                    <label className="form-label"><strong>Middle Name</strong></label>
+                    <input
+                      type="text"
+                      name="middle_name"
+                      className="form-control"
+                      value={createUserData.middle_name}
+                      onChange={handleCreateUserChange}
+                      placeholder="Middle name"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                  <div className="col-md-4 mb-3">
+                    <label className="form-label"><strong>Last Name *</strong></label>
+                    <input
+                      type="text"
+                      name="last_name"
+                      className="form-control"
+                      value={createUserData.last_name}
+                      onChange={handleCreateUserChange}
+                      placeholder="Last name"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                </div>
+
+                <div className="row">
+                  <div className="col-md-6 mb-3">
+                    <label className="form-label"><strong>Password *</strong></label>
+                    <input
+                      type="password"
+                      name="password"
+                      className="form-control"
+                      value={createUserData.password}
+                      onChange={handleCreateUserChange}
+                      placeholder="Min 8 characters"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                  <div className="col-md-6 mb-3">
+                    <label className="form-label"><strong>Confirm Password *</strong></label>
+                    <input
+                      type="password"
+                      name="confirm_password"
+                      className="form-control"
+                      value={createUserData.confirm_password}
+                      onChange={handleCreateUserChange}
+                      placeholder="Confirm password"
+                      disabled={createUserLoading}
+                    />
+                  </div>
+                </div>
+
+                {/* STUDENT-SPECIFIC FIELDS */}
+                {createUserRole === 'student' && (
+                  <>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Registration Number</strong></label>
+                      <input
+                        type="text"
+                        name="registration_number"
+                        className="form-control"
+                        value={createUserData.registration_number}
+                        onChange={handleCreateUserChange}
+                        placeholder="e.g., 2023-04-001"
+                        disabled={createUserLoading}
+                      />
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Assign Mentor</strong></label>
+                      <select
+                        name="mentor"
+                        className="form-select"
+                        value={createUserData.mentor || ''}
+                        onChange={handleCreateUserChange}
+                        disabled={createUserLoading}
+                      >
+                        <option value="">No mentor assigned</option>
+                        {mentors.map((mentor) => {
+                          const capacity = getMentorCapacityStatus(mentor);
+                          return (
+                            <option key={mentor.id} value={mentor.id} disabled={capacity.isFull}>
+                              {mentor.first_name} {mentor.last_name} 
+                              ({capacity.current}/{capacity.max} students {capacity.isFull ? '- FULL' : ''})
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </div>
+                  </>
+                )}
+
+                {/* MENTOR-SPECIFIC FIELDS */}
+                {createUserRole === 'mentor' && (
+                  <>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Max Students</strong></label>
+                      <input
+                        type="number"
+                        name="max_students"
+                        className="form-control"
+                        value={createUserData.max_students}
+                        onChange={handleCreateUserChange}
+                        min="1"
+                        max="20"
+                        disabled={createUserLoading}
+                      />
+                      <small className="text-muted">Maximum number of students this mentor can handle</small>
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Specialization</strong></label>
+                      <select
+                        name="specialization"
+                        className="form-select"
+                        value={createUserData.specialization || ''}
+                        onChange={handleCreateUserChange}
+                        disabled={createUserLoading}
+                      >
+                        <option value="">General (No specialization)</option>
+                        {projectTypes.map((pt) => (
+                          <option key={pt.id} value={pt.id}>
+                            {pt.name}
+                          </option>
+                        ))}
+                      </select>
+                      <small className="text-muted">Select ONE project type this mentor specializes in</small>
+                    </div>
+                    <div className="mb-3">
+                      <label className="form-label"><strong>Mentor Bio</strong></label>
+                      <textarea
+                        name="mentor_bio"
+                        className="form-control"
+                        rows="3"
+                        value={createUserData.mentor_bio || ''}
+                        onChange={handleCreateUserChange}
+                        placeholder="Brief description of mentor's expertise..."
+                        disabled={createUserLoading}
+                      />
+                    </div>
+                  </>
+                )}
+
+                <div className="d-flex gap-2">
+                  <button 
+                    className="btn btn-success" 
+                    onClick={handleCreateUser}
+                    disabled={createUserLoading}
+                  >
+                    {createUserLoading ? 'Creating...' : `Create ${createUserRole === 'mentor' ? 'Mentor' : 'Student'}`}
+                  </button>
+                  <button 
+                    className="btn btn-outline-secondary" 
+                    onClick={() => setShowCreateUserModal(false)}
+                    disabled={createUserLoading}
+                  >
+                    Cancel
+                  </button>
+                </div>
+                {createUserMessage && (
+                  <p className={`mt-3 ${createUserMessage.includes('successfully') ? 'text-success' : 'text-danger'}`}>
+                    {createUserMessage}
+                  </p>
+                )}
               </div>
             </div>
           </div>
@@ -2401,21 +2815,18 @@ function CoordinatorDashboard() {
           <div className="col-md-6">
             <div className="card dashboard-card">
               <div className="card-body">
-                <h5 className="card-title">Bulk Operations</h5>
-                <p className="card-text">Perform bulk operations like mentor assignment and data export</p>
-                <button 
-                  className="btn btn-primary" 
-                  onClick={() => {
-                    setExpandedProjects(true);
-                    if (projects.length > 0) {
-                      const allProjectIds = projects.map(p => p.id);
-                      setSelectedProjects(allProjectIds);
-                      setSelectAll(true);
-                    }
-                  }}
-                >
-                  Select All Projects for Bulk Actions
-                </button>
+                <h5 className="card-title">Quick Actions</h5>
+                <div className="d-flex flex-wrap gap-2">
+                  <button className="btn btn-sm btn-success" onClick={() => openCreateUserModal('mentor')}>
+                    + Add Mentor
+                  </button>
+                  <button className="btn btn-sm btn-primary" onClick={() => openCreateUserModal('student')}>
+                    + Add Student
+                  </button>
+                  <button className="btn btn-sm btn-info" onClick={() => openPresentationModal(null)}>
+                    + New Presentation
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -3275,6 +3686,58 @@ function CoordinatorDashboard() {
           </div>
         </div>
       )}
+
+      {/* Toast Notification Styles */}
+      <style jsx>{`
+        .toast-notification {
+          position: fixed;
+          top: 80px;
+          right: 20px;
+          padding: 12px 20px;
+          border-radius: 8px;
+          background: white;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          z-index: 9999;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          min-width: 250px;
+          max-width: 450px;
+          animation: slideIn 0.3s ease;
+          border-left: 4px solid #28a745;
+        }
+        .toast-notification.toast-danger {
+          border-left-color: #dc3545;
+        }
+        .toast-notification.toast-info {
+          border-left-color: #17a2b8;
+        }
+        .toast-notification.toast-warning {
+          border-left-color: #ffc107;
+        }
+        .toast-icon {
+          font-size: 1.2rem;
+        }
+        .toast-close {
+          background: none;
+          border: none;
+          font-size: 1.2rem;
+          cursor: pointer;
+          margin-left: auto;
+          color: #999;
+        }
+        .toast-close:hover {
+          color: #333;
+        }
+        @keyframes slideIn {
+          from { transform: translateX(100%); opacity: 0; }
+          to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slideOut {
+          from { transform: translateX(0); opacity: 1; }
+          to { transform: translateX(100%); opacity: 0; }
+        }
+      `}</style>
     </div>
   );
 }
