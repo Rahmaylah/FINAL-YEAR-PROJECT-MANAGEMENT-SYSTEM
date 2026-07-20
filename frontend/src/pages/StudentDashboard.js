@@ -101,27 +101,51 @@ function StudentDashboard() {
   }, [user]);
 
   // ============================================================
-  // FETCH PROJECT WITH INDIVIDUAL API CALL FOR FRESH DATA
+  // FETCH PROJECT DATA - SIMPLIFIED AND FASTER
   // ============================================================
-  const fetchFreshProjectData = async () => {
+  const fetchProjectData = async () => {
     try {
       const projectsResponse = await axios.get('/api/projects/');
-      console.log('🔍 === PROJECTS API RESPONSE ===');
-      console.log('Results:', projectsResponse.data.results);
+      const projectsData = projectsResponse.data.results || [];
 
-      if (projectsResponse.data.results && projectsResponse.data.results.length > 0) {
-        const projectData = projectsResponse.data.results[0];
+      if (projectsData.length > 0) {
+        const projectData = projectsData[0];
+        setProject(projectData);
         
-        const individualResponse = await axios.get(`/api/projects/${projectData.id}/`);
-        console.log('📌 Individual Project Response:', individualResponse.data);
-        console.log('💬 mentor_comment from individual:', individualResponse.data.mentor_comment);
-        console.log('🔍 is_flagged_duplicate:', individualResponse.data.is_flagged_duplicate);
+        setFormData({
+          title: projectData.title || '',
+          project_type: projectData.project_type?.id || projectData.project_type || '',
+          main_objective: projectData.main_objective || '',
+          specific_objectives: projectData.specific_objectives?.join('--') || '',
+          project_description: projectData.project_description || '',
+          implementation_details: projectData.implementation_details || ''
+        });
         
-        return individualResponse.data;
+        // If flagged, fetch similar projects
+        if (projectData.is_flagged_duplicate) {
+          setTimeout(() => {
+            fetchSimilarProjects();
+          }, 500);
+        }
+        
+        return projectData;
+      } else {
+        setProject(null);
+        setFormData({
+          title: '',
+          project_type: '',
+          main_objective: '',
+          specific_objectives: '',
+          project_description: '',
+          implementation_details: ''
+        });
+        setSimilarProjects([]);
+        setSimilarError('');
+        setSimilarProjectsExpanded(false);
+        return null;
       }
-      return null;
     } catch (error) {
-      console.error('Error fetching fresh project data:', error);
+      console.error('Error fetching project data:', error);
       return null;
     }
   };
@@ -131,38 +155,10 @@ function StudentDashboard() {
     const fetchData = async () => {
       setLoading(true);
       try {
-        const freshProjectData = await fetchFreshProjectData();
+        // Fetch project data
+        await fetchProjectData();
 
-        if (freshProjectData) {
-          console.log('📌 === SETTING PROJECT WITH FRESH DATA ===');
-          console.log('💬 mentor_comment:', freshProjectData.mentor_comment);
-          console.log('🔍 is_flagged_duplicate:', freshProjectData.is_flagged_duplicate);
-          setProject(freshProjectData);
-          
-          setFormData({
-            title: freshProjectData.title || '',
-            project_type: freshProjectData.project_type?.id || freshProjectData.project_type || '',
-            main_objective: freshProjectData.main_objective || '',
-            specific_objectives: freshProjectData.specific_objectives?.join('--') || '',
-            project_description: freshProjectData.project_description || '',
-            implementation_details: freshProjectData.implementation_details || ''
-          });
-        } else {
-          console.log('⚠️ No project found for this student');
-          setProject(null);
-          setFormData({
-            title: '',
-            project_type: '',
-            main_objective: '',
-            specific_objectives: '',
-            project_description: '',
-            implementation_details: ''
-          });
-          setSimilarProjects([]);
-          setSimilarError('');
-          setSimilarProjectsExpanded(false);
-        }
-
+        // Fetch mentor info
         if (user?.mentor_info) {
           setMentor(user.mentor_info);
         } else if (user?.mentor) {
@@ -217,13 +213,6 @@ function StudentDashboard() {
             return aDate - bDate;
           });
           
-          console.log('📊 Sorted Results:', sortedResults);
-          console.log('📊 Criteria Scores:', sortedResults.map(r => ({
-            id: r.id,
-            marks: r.marks,
-            criteria_scores: r.criteria_scores
-          })));
-          
           setPresentationResults(sortedResults);
         } catch (error) {
           console.error('Error fetching presentation results:', error);
@@ -253,7 +242,7 @@ function StudentDashboard() {
     }
 
     if (!project.is_flagged_duplicate) {
-      console.log('🔍 Project is not flagged - hiding similar projects');
+      console.log('Project is not flagged - hiding similar projects');
       setSimilarProjects([]);
       setSimilarError('No similar projects found');
       setSimilarProjectsExpanded(true);
@@ -266,11 +255,8 @@ function StudentDashboard() {
 
     try {
       const response = await axios.get(`/api/projects/${project.id}/similar-all/`);
-      console.log('🔍 === SIMILAR PROJECTS RESPONSE ===');
-      console.log('Response:', response.data);
       
       if (!response.data || response.data.count === 0 || !response.data.results || response.data.results.length === 0) {
-        console.log('⚠️ No similar projects found in response');
         setSimilarProjects([]);
         setSimilarError(response.data?.message || 'No similar projects found');
         setSimilarProjectsExpanded(true);
@@ -293,12 +279,11 @@ function StudentDashboard() {
         project_type_name: item.project_type_name || 'N/A'
       }));
 
-      console.log('Formatted projects:', formattedProjects);
       setSimilarProjects(formattedProjects);
       setSimilarProjectsExpanded(true);
       
     } catch (error) {
-      console.error('❌ Error fetching similar projects:', error);
+      console.error('Error fetching similar projects:', error);
       if (error.response) {
         if (error.response.status === 404) {
           setSimilarError('Similar projects endpoint not found');
@@ -352,7 +337,7 @@ function StudentDashboard() {
       localStorage.setItem('user', JSON.stringify({ ...user, ...response.data }));
     } catch (error) {
       console.error('Error saving profile:', error);
-      setProfileMessage('❌ Unable to update profile. Please try again.');
+      setProfileMessage('Unable to update profile. Please try again.');
     } finally {
       setProfileSaving(false);
     }
@@ -369,19 +354,19 @@ function StudentDashboard() {
     setPasswordMessage('');
 
     if (passwordData.new_password !== passwordData.confirm_password) {
-      setPasswordMessage('❌ New passwords do not match.');
+      setPasswordMessage('New passwords do not match.');
       setPasswordSaving(false);
       return;
     }
 
     if (passwordData.new_password.length < 8) {
-      setPasswordMessage('❌ New password must be at least 8 characters long.');
+      setPasswordMessage('New password must be at least 8 characters long.');
       setPasswordSaving(false);
       return;
     }
 
     try {
-      const response = await axios.post('/api/users/set_password/', {
+      await axios.post('/api/users/set_password/', {
         current_password: passwordData.current_password,
         new_password: passwordData.new_password
       });
@@ -399,12 +384,12 @@ function StudentDashboard() {
         } else if (error.response.data.detail) {
           setPasswordMessage(`❌ ${error.response.data.detail}`);
         } else {
-          setPasswordMessage('❌ Unable to change password. Please try again.');
+          setPasswordMessage('Unable to change password. Please try again.');
         }
       } else if (error.message) {
-        setPasswordMessage(`❌ Network error: ${error.message}`);
+        setPasswordMessage(`Network error: ${error.message}`);
       } else {
-        setPasswordMessage('❌ Unable to change password. Please try again.');
+        setPasswordMessage('Unable to change password. Please try again.');
       }
     } finally {
       setPasswordSaving(false);
@@ -437,6 +422,9 @@ function StudentDashboard() {
     }));
   };
 
+  // ============================================================
+  // ====== FAST SAVE - NO EXTRA FETCH ======
+  // ============================================================
   const handleSave = async () => {
     try {
       const specificObjArray = formData.specific_objectives
@@ -461,30 +449,34 @@ function StudentDashboard() {
         response = await axios.post('/api/projects/', projectData);
       }
 
-      const freshData = await fetchFreshProjectData();
-      if (freshData) {
-        setProject(freshData);
-      } else {
-        setProject(response.data);
-      }
+      // ====== FAST: Directly update project from response ======
+      setProject(response.data);
+      
+      // Update form data with response
+      setFormData({
+        title: response.data.title || '',
+        project_type: response.data.project_type?.id || response.data.project_type || '',
+        main_objective: response.data.main_objective || '',
+        specific_objectives: response.data.specific_objectives?.join('--') || '',
+        project_description: response.data.project_description || '',
+        implementation_details: response.data.implementation_details || ''
+      });
       
       setIsEditing(false);
       
-      if (response.data.is_flagged_duplicate) {
-        //alert(`⚠️ Your project has been flagged as a potential duplicate!\nSimilarity score: ${(response.data.duplicate_check_score * 100).toFixed(1)}%`);
-        alert(`Project Saved successfully`);
-      } else {
-        alert('Project saved successfully!');
-      }
+      // ====== SIMPLE MESSAGE ONLY ======
+      alert('Project saved successfully.');
       
-      if (response.data.id) {
+      // ====== FAST: Only fetch similar if flagged ======
+      if (response.data.is_flagged_duplicate && response.data.id) {
         setTimeout(() => {
           fetchSimilarProjects();
-        }, 1500);
+        }, 500);
       }
+      
     } catch (error) {
       console.error('Error saving project:', error);
-      alert('❌ Error saving project. Please try again.');
+      alert('Error saving project. Please try again.');
     }
   };
 
@@ -512,7 +504,7 @@ function StudentDashboard() {
       const fileExtension = file.name.split('.').pop().toLowerCase();
       
       if (fileType !== 'application/pdf' && fileExtension !== 'pdf') {
-        setDocumentUploadMessage('❌ Only PDF files are allowed. Please select a PDF document.');
+        setDocumentUploadMessage('Only PDF files are allowed. Please select a PDF document.');
         setDocumentUploadFile(null);
         event.target.value = '';
         return;
@@ -520,7 +512,7 @@ function StudentDashboard() {
       
       const maxSize = 10 * 1024 * 1024;
       if (file.size > maxSize) {
-        setDocumentUploadMessage(`❌ File size (${(file.size / (1024 * 1024)).toFixed(2)}MB) exceeds the maximum limit of 10MB.`);
+        setDocumentUploadMessage(`File size (${(file.size / (1024 * 1024)).toFixed(2)}MB) exceeds the maximum limit of 10MB.`);
         setDocumentUploadFile(null);
         event.target.value = '';
         return;
@@ -533,12 +525,12 @@ function StudentDashboard() {
 
   const handleUploadDocument = async () => {
     if (!project || !project.id) {
-      setDocumentUploadMessage('❌ Please save your project before uploading a document.');
+      setDocumentUploadMessage('Please save your project before uploading a document.');
       return;
     }
 
     if (!documentUploadFile) {
-      setDocumentUploadMessage('❌ Please select a PDF file to upload.');
+      setDocumentUploadMessage('Please select a PDF file to upload.');
       return;
     }
 
@@ -546,13 +538,13 @@ function StudentDashboard() {
     const fileExtension = documentUploadFile.name.split('.').pop().toLowerCase();
     
     if (fileType !== 'application/pdf' && fileExtension !== 'pdf') {
-      setDocumentUploadMessage('❌ Only PDF files are allowed.');
+      setDocumentUploadMessage('Only PDF files are allowed.');
       return;
     }
 
     const maxSize = 10 * 1024 * 1024;
     if (documentUploadFile.size > maxSize) {
-      setDocumentUploadMessage(`❌ File size exceeds the maximum limit of 10MB. Current file: ${(documentUploadFile.size / (1024 * 1024)).toFixed(2)}MB`);
+      setDocumentUploadMessage(`File size exceeds the maximum limit of 10MB. Current file: ${(documentUploadFile.size / (1024 * 1024)).toFixed(2)}MB`);
       return;
     }
 
@@ -573,13 +565,13 @@ function StudentDashboard() {
         ...prev,
         documents: [...(prev.documents || []), response.data]
       } : prev);
-      setDocumentUploadMessage('✅ Document uploaded successfully.');
+      setDocumentUploadMessage('Document uploaded successfully.');
       setTimeout(() => {
         handleCloseDocumentForm();
       }, 1500);
     } catch (error) {
       console.error('Error uploading document:', error);
-      setDocumentUploadMessage('❌ Unable to upload document. Please try again.');
+      setDocumentUploadMessage('Unable to upload document. Please try again.');
     } finally {
       setDocumentUploadLoading(false);
     }
